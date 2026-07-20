@@ -26,4 +26,10 @@ pub(crate) enum Error {
          SCIM owns the groups section — remove member entries from 'groups' in spec.policy.inline"
     )]
     ScimPolicyConflict,
+    #[error(
+        "spec.external is mutually exclusive with spec.policy, spec.scim, and \
+         spec.extraConfig; the external headscale's configuration and policy \
+         are managed outside the operator"
+    )]
+    ExternalSpecConflict,
 }

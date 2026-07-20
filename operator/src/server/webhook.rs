@@ -98,6 +98,19 @@ async fn validate(
         None => return AdmissionResponse::from(&request),
     };
 
+    // External instances have no operator-rendered config to test and no
+    // operator-owned policy/SCIM: only the connection details are ours.
+    if spec.external.is_some() {
+        if spec.policy.is_some() || spec.scim.is_some() || !spec.extra_config.is_empty() {
+            return AdmissionResponse::from(&request).deny(
+                "spec.external is mutually exclusive with spec.policy, spec.scim, and \
+                 spec.extraConfig; the external headscale's configuration and policy \
+                 are managed outside the operator",
+            );
+        }
+        return AdmissionResponse::from(&request);
+    }
+
     if spec.scim.is_some() && policy_has_groups_with_members(spec.policy.as_ref()) {
         return AdmissionResponse::from(&request).deny(
             "spec.policy.inline contains groups with members while spec.scim is set; \

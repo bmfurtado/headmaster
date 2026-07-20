@@ -39,6 +39,34 @@ spec:
                   Nodes will be reachable at `<hostname>.<dns_base_domain>` via the tailnet.
                 minLength: 1
                 type: string
+              external:
+                description: |-
+                  Connection details for a headscale server running *outside* the
+                  cluster. When set, the operator provisions no headscale resources —
+                  it only verifies reachability and lets Ingress proxies register
+                  against the external server (via `serverUrl`). Mutually exclusive
+                  with `policy`, `scim`, `extraConfig`, and `resources`: the external
+                  server's configuration and ACL policy belong to whoever operates it.
+                  `storage` is ignored.
+                nullable: true
+                properties:
+                  apiKeySecretRef:
+                    description: |-
+                      Name of an existing Secret in the operator namespace whose
+                      `HEADSCALE_API_KEY` key holds an API key for the external server.
+                      The operator never creates or rotates this Secret.
+                    minLength: 1
+                    type: string
+                  grpcEndpoint:
+                    description: |-
+                      gRPC endpoint of the external headscale server, as a URI
+                      (e.g. `http://100.64.0.1:50443` for h2c over a private network).
+                    minLength: 1
+                    type: string
+                required:
+                - apiKeySecretRef
+                - grpcEndpoint
+                type: object
               extraConfig:
                 default: {}
                 description: |-
@@ -256,7 +284,12 @@ spec:
                 minLength: 1
                 type: string
               storage:
-                description: Persistent storage for the headscale SQLite database.
+                default:
+                  size: 1Gi
+                  storageClass: null
+                description: |-
+                  Persistent storage for the headscale SQLite database.
+                  Ignored when `external` is set.
                 properties:
                   size:
                     default: 1Gi
@@ -282,7 +315,6 @@ spec:
             required:
             - dnsBaseDomain
             - serverUrl
-            - storage
             type: object
           status:
             description: Observed state of a `HeadscaleInstance`.

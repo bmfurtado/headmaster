@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use headscale_client::headscale::v1::ListUsersRequest;
 use k8s_ext::{ServiceExt, ServicePortExt, StatefulSetGetExt};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
@@ -27,6 +28,7 @@ use super::scim::{delete_scim_if_exists, ensure_scim};
 use super::{Error, PORT_GRPC, PORT_HTTP, PORT_METRICS};
 use crate::context::Context;
 use crate::controllers::applier::{Applier, ChildApplier, delete_ignoring_404};
+use crate::controllers::ingress::headscale_connect;
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
 use crate::types::{HeadscaleInstance, IngressAnnotations, ResourceStatus};
@@ -108,6 +110,10 @@ fn error_policy(_obj: Arc<HeadscaleInstance>, e: &Error, _ctx: Arc<Context>) -> 
 }
 
 async fn apply(obj: Arc<HeadscaleInstance>, ctx: &Context) -> Result<Action, Error> {
+    if obj.spec.external.is_some() {
+        return apply_external(&obj, ctx).await;
+    }
+
     let ns = obj.namespace().ok_or(Error::MissingNamespace)?;
     let name = obj.name_any();
     let client = &ctx.client;
@@ -213,6 +219,78 @@ async fn apply(obj: Arc<HeadscaleInstance>, ctx: &Context) -> Result<Action, Err
     // syncs new groups to headscale. SCIM is k8s-agnostic and does not touch
     // any watched resource, so watch events alone are not sufficient.
     Ok(Action::requeue(Duration::from_secs(60)))
+}
+
+/// Reconciles an instance whose headscale runs outside the cluster. No child
+/// resources exist: readiness is purely "an authenticated gRPC call to the
+/// external server succeeds". API-key bootstrap, policy sync, and SCIM never
+/// run here — the external server's operator owns configuration and policy,
+/// so a `SetPolicy` from us (including the allow-all reset for `policy:
+/// None`) would clobber state we do not own.
+async fn apply_external(obj: &Arc<HeadscaleInstance>, ctx: &Context) -> Result<Action, Error> {
+    let ns = obj.namespace().ok_or(Error::MissingNamespace)?;
+    let name = obj.name_any();
+    let old_status = obj.status.clone().unwrap_or_default();
+    let generation = obj.metadata.generation.unwrap_or(0);
+    let a = Applier::from_ctx(ctx);
+
+    // Webhook-enforced, but guard again in case admission was bypassed.
+    if obj.spec.policy.is_some() || obj.spec.scim.is_some() || !obj.spec.extra_config.is_empty() {
+        let e = Error::ExternalSpecConflict;
+        let mut error_status = old_status.clone();
+        error_status.update_ready(false, "ExternalSpecConflict", e.to_string(), generation);
+        let _ = a.apply_status(&**obj, &error_status).await;
+        return Err(e);
+    }
+
+    let probe: Result<(), String> = async {
+        let mut client = headscale_connect(ctx, &ns, &name)
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .list_users(ListUsersRequest::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
+
+    let mut new_status = old_status.clone();
+    let (ready, requeue_secs) = match &probe {
+        Ok(()) => {
+            new_status.update_ready(
+                true,
+                "ExternalReachable",
+                "external headscale answered an authenticated gRPC call",
+                generation,
+            );
+            // Periodic re-probe so a dead server flips the instance (and
+            // with it new Ingress provisioning) to not-ready.
+            (true, 60)
+        }
+        Err(e) => {
+            new_status.update_ready(
+                false,
+                "ExternalUnreachable",
+                format!("external headscale probe failed: {e}"),
+                generation,
+            );
+            (false, 15)
+        }
+    };
+    a.apply_status(&**obj, &new_status).await?;
+    let obj_ref = obj.object_ref(&());
+    ctx.recorder()
+        .publish_transitions(&old_status, &new_status, &obj_ref)
+        .await;
+
+    if !ready {
+        tracing::warn!(
+            name = name,
+            "HeadscaleInstance (external): probe failed, requeueing"
+        );
+    }
+    Ok(Action::requeue(Duration::from_secs(requeue_secs)))
 }
 
 /// Cleans up a `HeadscaleInstance` before the finalizer is removed.
@@ -367,4 +445,148 @@ async fn ensure_headscale(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controllers::headscale_instance::test_support::{minimal_instance, test_ctx};
+    use crate::test_support::FaultService;
+    use crate::types::ExternalSpec;
+    use headscale_client::fake::{FakeHeadscaleServer, spawn_fake_channel};
+    use headscale_client::{
+        AuthInterceptor, Channel, HeadscaleConnector, HeadscaleServiceClient, TransportError,
+    };
+    use k8s_openapi::ByteString;
+    use k8s_openapi::api::core::v1::Secret;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    fn external_instance() -> HeadscaleInstance {
+        let mut instance = minimal_instance("ext");
+        instance.spec.external = Some(ExternalSpec {
+            grpc_endpoint: "http://100.64.0.3:50443".to_string(),
+            api_key_secret_ref: "external-api-key".to_string(),
+        });
+        instance
+    }
+
+    struct FakeConnector(Channel);
+
+    #[async_trait::async_trait]
+    impl HeadscaleConnector for FakeConnector {
+        async fn connect(
+            &self,
+            _endpoint: &str,
+            api_key: &str,
+        ) -> Result<headscale_client::AuthenticatedClient, TransportError> {
+            Ok(HeadscaleServiceClient::with_interceptor(
+                self.0.clone(),
+                AuthInterceptor::bearer(api_key),
+            ))
+        }
+    }
+
+    /// K8s responder for the external path: the instance GET (issued by
+    /// headscale_connect), the referenced API-key Secret, and status PATCHes.
+    fn external_responder(m: &http::Method, path: &str) -> (u16, Vec<u8>) {
+        if path.contains("headscaleinstances") && *m == http::Method::GET {
+            return (200, serde_json::to_vec(&external_instance()).unwrap());
+        }
+        if path.contains("/secrets/external-api-key") {
+            let secret = Secret {
+                metadata: ObjectMeta {
+                    name: Some("external-api-key".to_string()),
+                    namespace: Some("default".to_string()),
+                    resource_version: Some("1".to_string()),
+                    ..Default::default()
+                },
+                data: Some(std::collections::BTreeMap::from([(
+                    "HEADSCALE_API_KEY".to_string(),
+                    ByteString(b"test-api-key".to_vec()),
+                )])),
+                ..Default::default()
+            };
+            return (200, serde_json::to_vec(&secret).unwrap());
+        }
+        if *m == http::Method::PATCH {
+            return (200, serde_json::to_vec(&external_instance()).unwrap());
+        }
+        (404, br#"{"code":404}"#.to_vec())
+    }
+
+    #[tokio::test]
+    async fn apply_external_ready_when_probe_succeeds() {
+        let server = FakeHeadscaleServer::default();
+        let channel = spawn_fake_channel(server).await;
+        let (k8s, calls) = FaultService::tracked(external_responder);
+        let ctx = Context {
+            headscale: std::sync::Arc::new(FakeConnector(channel)),
+            ..test_ctx(k8s)
+        };
+
+        let result = apply_external(&Arc::new(external_instance()), &ctx).await;
+
+        assert!(result.is_ok(), "probe success must reconcile cleanly");
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|(m, p)| m == "PATCH" && p.contains("/status")),
+            "a Ready status patch must be issued: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_external_not_ready_when_secret_missing() {
+        // Responder without the API-key Secret: headscale_connect fails, the
+        // instance must go not-ready (status patch) without erroring out.
+        fn responder(m: &http::Method, path: &str) -> (u16, Vec<u8>) {
+            if path.contains("headscaleinstances") && *m == http::Method::GET {
+                return (200, serde_json::to_vec(&external_instance()).unwrap());
+            }
+            if *m == http::Method::PATCH {
+                return (200, serde_json::to_vec(&external_instance()).unwrap());
+            }
+            (404, br#"{"code":404}"#.to_vec())
+        }
+        let server = FakeHeadscaleServer::default();
+        let channel = spawn_fake_channel(server).await;
+        let (k8s, calls) = FaultService::tracked(responder);
+        let ctx = Context {
+            headscale: std::sync::Arc::new(FakeConnector(channel)),
+            ..test_ctx(k8s)
+        };
+
+        let result = apply_external(&Arc::new(external_instance()), &ctx).await;
+
+        assert!(result.is_ok(), "probe failure must requeue, not error");
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|(m, p)| m == "PATCH" && p.contains("/status")),
+            "a not-ready status patch must be issued: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_external_rejects_operator_owned_fields() {
+        let mut instance = external_instance();
+        instance.spec.policy = Some(crate::types::HeadscaleInstancePolicy::Inline {
+            inline: r#"{"acls":[]}"#.to_string(),
+        });
+        let server = FakeHeadscaleServer::default();
+        let channel = spawn_fake_channel(server).await;
+        let ctx = Context {
+            headscale: std::sync::Arc::new(FakeConnector(channel)),
+            ..test_ctx(FaultService::client(external_responder))
+        };
+
+        let result = apply_external(&Arc::new(instance), &ctx).await;
+
+        assert!(
+            matches!(result, Err(Error::ExternalSpecConflict)),
+            "external + policy must be rejected even past the webhook"
+        );
+    }
 }

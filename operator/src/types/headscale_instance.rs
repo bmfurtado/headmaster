@@ -35,7 +35,18 @@ pub struct HeadscaleInstanceSpec {
     /// Nodes will be reachable at `<hostname>.<dns_base_domain>` via the tailnet.
     #[schemars(length(min = 1))]
     pub dns_base_domain: String,
+    /// Connection details for a headscale server running *outside* the
+    /// cluster. When set, the operator provisions no headscale resources —
+    /// it only verifies reachability and lets Ingress proxies register
+    /// against the external server (via `serverUrl`). Mutually exclusive
+    /// with `policy`, `scim`, `extraConfig`, and `resources`: the external
+    /// server's configuration and ACL policy belong to whoever operates it.
+    /// `storage` is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalSpec>,
     /// Persistent storage for the headscale SQLite database.
+    /// Ignored when `external` is set.
+    #[serde(default)]
     pub storage: StorageSpec,
     /// Headscale access-control policy applied to this instance.
     /// When omitted, headscale allows all traffic by default.
@@ -76,6 +87,7 @@ impl Default for HeadscaleInstanceSpec {
         Self {
             server_url: String::new(),
             dns_base_domain: String::new(),
+            external: None,
             storage: StorageSpec::default(),
             policy: None,
             scim: None,
@@ -85,6 +97,21 @@ impl Default for HeadscaleInstanceSpec {
             labels: BTreeMap::new(),
         }
     }
+}
+
+/// Connection details for an externally-managed headscale server.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSpec {
+    /// gRPC endpoint of the external headscale server, as a URI
+    /// (e.g. `http://100.64.0.1:50443` for h2c over a private network).
+    #[schemars(length(min = 1))]
+    pub grpc_endpoint: String,
+    /// Name of an existing Secret in the operator namespace whose
+    /// `HEADSCALE_API_KEY` key holds an API key for the external server.
+    /// The operator never creates or rotates this Secret.
+    #[schemars(length(min = 1))]
+    pub api_key_secret_ref: String,
 }
 
 /// SCIM 2.0 server configuration for this instance.
@@ -259,6 +286,37 @@ mod tests {
                 "resources": { "requests": { "cpu": "100m", "memory": "128Mi" } },
                 "watchedNamespaces": ["*"]
             })
+        );
+    }
+
+    #[test]
+    fn external_omitted_is_none() {
+        let spec: HeadscaleInstanceSpec = serde_saphyr::from_str(indoc! {"
+            serverUrl: https://headscale.example.com
+            dnsBaseDomain: ts.example.com
+            storage:
+              size: 1Gi
+        "})
+        .unwrap();
+        assert!(spec.external.is_none());
+    }
+
+    #[test]
+    fn external_round_trips_and_storage_may_be_omitted() {
+        let spec: HeadscaleInstanceSpec = serde_saphyr::from_str(indoc! {"
+            serverUrl: https://headscale.example.com
+            dnsBaseDomain: ts.example.com
+            external:
+              grpcEndpoint: http://100.64.0.1:50443
+              apiKeySecretRef: headscale-api-key
+        "})
+        .unwrap();
+        let ext = spec.external.as_ref().expect("external must be present");
+        assert_eq!(ext.grpc_endpoint, "http://100.64.0.1:50443");
+        assert_eq!(ext.api_key_secret_ref, "headscale-api-key");
+        assert_eq!(
+            spec.storage.size, "1Gi",
+            "storage must default when omitted (external instances don't need it)"
         );
     }
 

@@ -369,8 +369,26 @@ mod tests {
         }
     }
 
-    /// Returns a K8s GET response containing the headscale API-key Secret.
-    fn api_key_secret(_: &http::Method, _: &str) -> (u16, Vec<u8>) {
+    /// Returns the managed HeadscaleInstance for instance GETs (which
+    /// headscale_connect performs first) and the API-key Secret otherwise.
+    fn api_key_secret(_: &http::Method, path: &str) -> (u16, Vec<u8>) {
+        if path.contains("headscaleinstances") {
+            let instance = crate::types::HeadscaleInstance {
+                metadata: ObjectMeta {
+                    name: Some("test-instance".to_string()),
+                    namespace: Some("default".to_string()),
+                    uid: Some("uid-hi-1".to_string()),
+                    ..Default::default()
+                },
+                spec: crate::types::HeadscaleInstanceSpec {
+                    server_url: "https://headscale.example.com".to_string(),
+                    dns_base_domain: "ts.example.com".to_string(),
+                    ..Default::default()
+                },
+                status: None,
+            };
+            return (200, serde_json::to_vec(&instance).unwrap());
+        }
         let secret = Secret {
             metadata: ObjectMeta {
                 name: Some("headscale-api-key-test-instance".to_string()),

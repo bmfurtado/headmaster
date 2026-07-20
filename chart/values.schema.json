@@ -11,6 +11,27 @@
             "minLength": 1,
             "type": "string"
           },
+          "external": {
+            "description": "Connection details for a headscale server running *outside* the\ncluster. When set, the operator provisions no headscale resources —\nit only verifies reachability and lets Ingress proxies register\nagainst the external server (via `serverUrl`). Mutually exclusive\nwith `policy`, `scim`, `extraConfig`, and `resources`: the external\nserver's configuration and ACL policy belong to whoever operates it.\n`storage` is ignored.",
+            "nullable": true,
+            "properties": {
+              "apiKeySecretRef": {
+                "description": "Name of an existing Secret in the operator namespace whose\n`HEADSCALE_API_KEY` key holds an API key for the external server.\nThe operator never creates or rotates this Secret.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "grpcEndpoint": {
+                "description": "gRPC endpoint of the external headscale server, as a URI\n(e.g. `http://100.64.0.1:50443` for h2c over a private network).",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "apiKeySecretRef",
+              "grpcEndpoint"
+            ],
+            "type": "object"
+          },
           "extraConfig": {
             "default": {},
             "description": "Arbitrary extra configuration merged into the headscale config file.\n\nThe admission webhook rejects entries that would collide with operator-managed keys:\ntop-level `server_url`, `listen_addr`, `grpc_listen_addr`, `grpc_allow_insecure`,\n`metrics_listen_addr`, `unix_socket`, `unix_socket_permission`, `noise`, `database`,\n`policy`, and the `dns.magic_dns` / `dns.base_domain` subkeys. Other `dns.*` keys\n(e.g. `nameservers`, `split_dns`, `extra_records`) are deep-merged into the operator\ndefaults. Omit this field to use defaults only.",
@@ -109,7 +130,11 @@
             "type": "string"
           },
           "storage": {
-            "description": "Persistent storage for the headscale SQLite database.",
+            "default": {
+              "size": "1Gi",
+              "storageClass": null
+            },
+            "description": "Persistent storage for the headscale SQLite database.\nIgnored when `external` is set.",
             "properties": {
               "size": {
                 "default": "1Gi",
@@ -139,8 +164,7 @@
         },
         "required": [
           "dnsBaseDomain",
-          "serverUrl",
-          "storage"
+          "serverUrl"
         ],
         "type": "object"
       },

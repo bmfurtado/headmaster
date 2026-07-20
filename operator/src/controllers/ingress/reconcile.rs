@@ -367,10 +367,16 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
     }
 
     let dns_base_domain = instance.spec.dns_base_domain.clone();
-    let internal_headscale_url = format!(
-        "http://headscale-server-{}.{op_ns}.svc.cluster.local:8080",
-        annotations.headscale_ref,
-    );
+    // The login/control URL the proxy's tailscaled dials: the in-cluster
+    // service for managed instances, the public server URL for external ones.
+    let login_url = if instance.spec.external.is_some() {
+        instance.spec.server_url.clone()
+    } else {
+        format!(
+            "http://headscale-server-{}.{op_ns}.svc.cluster.local:8080",
+            annotations.headscale_ref,
+        )
+    };
     let tailnet_fqdn = format!("{}.{dns_base_domain}", annotations.hostname);
 
     let child = ChildApplier::for_proxy(
@@ -517,7 +523,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         &child,
         &names,
         &ctx.proxy_image,
-        &internal_headscale_url,
+        &login_url,
         &annotations.hostname,
         wg_node_port,
     )
@@ -847,7 +853,21 @@ pub(crate) async fn headscale_connect(
     namespace: &str,
     name: &str,
 ) -> Result<AuthenticatedClient, kube::Error> {
-    let secret_name = format!("headscale-api-key-{name}");
+    // External instances carry their own gRPC endpoint and API-key Secret;
+    // managed instances use the in-cluster service and the bootstrap-created
+    // Secret. A 404 on the instance GET propagates exactly like the managed
+    // path's missing-secret 404, which callers already treat as "instance
+    // gone" during cleanup.
+    let instance = Api::<HeadscaleInstance>::namespaced(ctx.client.clone(), namespace)
+        .get(name)
+        .await?;
+    let (endpoint, secret_name) = match &instance.spec.external {
+        Some(ext) => (ext.grpc_endpoint.clone(), ext.api_key_secret_ref.clone()),
+        None => (
+            format!("http://headscale-server-{name}.{namespace}.svc:50443"),
+            format!("headscale-api-key-{name}"),
+        ),
+    };
     let api_key = Api::<Secret>::namespaced(ctx.client.clone(), namespace)
         .get(&secret_name)
         .await
@@ -875,10 +895,7 @@ pub(crate) async fn headscale_connect(
             ))
         })?;
     ctx.headscale
-        .connect(
-            &format!("http://headscale-server-{name}.{namespace}.svc:50443"),
-            &api_key,
-        )
+        .connect(&endpoint, &api_key)
         .await
         .map_err(|e| kube::Error::Service(Box::new(e)))
 }

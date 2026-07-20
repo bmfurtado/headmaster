@@ -94,6 +94,29 @@ spec:
 Instances can also be managed as standalone `HeadscaleInstance` manifests
 applied directly to the cluster.
 
+### External headscale (fork addition)
+
+An instance can point at a headscale server managed _outside_ the cluster.
+The operator then provisions nothing for it — it only verifies reachability
+and uses it to mint pre-auth keys and register Ingress proxies:
+
+```yaml
+headscaleInstances:
+  main:
+    serverUrl: https://headscale.example.com
+    dnsBaseDomain: ts.example.com
+    external:
+      # gRPC endpoint of the existing server (h2c URI; reachable from pods).
+      grpcEndpoint: http://100.64.0.3:50443
+      # Existing Secret in the operator namespace with key HEADSCALE_API_KEY.
+      apiKeySecretRef: headscale-api-key
+```
+
+`external` is mutually exclusive with `policy`, `scim`, and `extraConfig`:
+the external server's configuration and ACL policy stay with whoever runs
+it, and the operator never calls `SetPolicy` (per-Ingress `access` grants
+are therefore unavailable — manage grants in the external policy instead).
+
 See [`examples/`](examples/) for a full values file including OIDC and SCIM
 configuration.
 
