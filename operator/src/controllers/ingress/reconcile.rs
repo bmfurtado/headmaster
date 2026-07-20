@@ -537,16 +537,20 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
     // every reconcile. ensure_auth_key returns early when the config secret
     // already exists, so without this call adding or removing access grants
     // after the proxy is registered would never update the node's tags.
+    // An empty desired set is skipped: headscale rejects SetTags([]) — a
+    // tag-less proxy (user-owned node, no grants) simply never syncs tags.
     let mut set_tags_failed = false;
-    if let Some(node_id) = device_id.as_ref().and_then(|s| s.parse::<u64>().ok()) {
-        let desired_tags: Vec<String> = annotations
-            .managed_key_tags
-            .iter()
-            .cloned()
-            .chain(auto_tag.iter().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
+    let desired_tags: Vec<String> = annotations
+        .managed_key_tags
+        .iter()
+        .cloned()
+        .chain(auto_tag.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if let Some(node_id) = device_id.as_ref().and_then(|s| s.parse::<u64>().ok())
+        && !desired_tags.is_empty()
+    {
         if let Err(e) = headscale
             .set_tags(SetTagsRequest {
                 node_id,

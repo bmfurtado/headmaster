@@ -17,3 +17,8 @@ rules:
   - apiGroups: [""]
     resources: [namespaces]
     verbs: [get]
+  # Named-port resolution: Ingress backends may reference Service ports by
+  # name, and the Ingress can live in any namespace.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get]
