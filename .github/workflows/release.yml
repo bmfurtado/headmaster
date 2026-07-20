@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Manual escape hatch for forks where tag-push events don't fire: run with
+  # --ref <tag> so GITHUB_REF_NAME is the release tag.
+  workflow_dispatch:
 
 permissions:
   contents: write
