@@ -13,6 +13,13 @@ socatImage:
   repository: alpine/socat
   tag: 1.8.0.3
 
+egressDns:
+  # Maintain a `headmaster-egress.override` key in the kube-system
+  # coredns-custom ConfigMap with one rewrite per egress Service, so pods
+  # resolve each tailnet-fqdn to its egress proxy cluster-wide. Relies on
+  # CoreDNS importing coredns-custom (k3s and AKS do); leave off elsewhere.
+  corednsCustom: false
+
 image:
   repository: ghcr.io/potatonode/headmaster
   tag: ""  # defaults to .Chart.AppVersion

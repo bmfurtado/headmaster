@@ -215,6 +215,17 @@
       },
       "type": "object"
     },
+    "egressDns": {
+      "additionalProperties": false,
+      "description": "In-cluster DNS for tailnet egress Services.",
+      "properties": {
+        "corednsCustom": {
+          "description": "Own a headmaster-egress.override key in the kube-system coredns-custom ConfigMap, rewriting each egress tailnet-fqdn to its proxy Service. Requires CoreDNS to import coredns-custom (k3s, AKS).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "image": {
       "additionalProperties": false,
       "description": "Container image for the headmaster operator.",

@@ -48,6 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("HEADSCALE_IMAGE").expect("HEADSCALE_IMAGE env var must be set");
     let proxy_image = std::env::var("PROXY_IMAGE").expect("PROXY_IMAGE env var must be set");
     let socat_image = std::env::var("SOCAT_IMAGE").expect("SOCAT_IMAGE env var must be set");
+    let egress_dns_coredns_custom =
+        std::env::var("EGRESS_DNS_COREDNS_CUSTOM").is_ok_and(|v| v == "true");
     let operator_image =
         std::env::var("OPERATOR_IMAGE").expect("OPERATOR_IMAGE env var must be set");
 
@@ -99,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         headscale_image,
         proxy_image,
         socat_image,
+        egress_dns_coredns_custom,
         operator_image,
         claim_default,
     });

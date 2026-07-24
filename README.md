@@ -257,6 +257,14 @@ Rules of the road:
   `host-network` do not apply and are ignored with a warning event.
 - The forwarder image is configurable via the chart's `socatImage` value
   (default `alpine/socat`).
+- With the chart's `egressDns.corednsCustom` enabled, the operator also
+  maintains in-cluster DNS: a `headmaster-egress.override` key in the
+  `kube-system/coredns-custom` ConfigMap rewrites each `tailnet-fqdn` to its
+  egress proxy Service, so pods in any namespace dial the real tailnet
+  hostname with correct SNI and full certificate validation. Requires a
+  CoreDNS that imports `coredns-custom` (k3s, AKS). Tailnet FQDNs are
+  treated as cluster-unique; duplicates get a `DuplicateTailnetFqdn`
+  warning event and the first Service in (namespace, name) order wins.
 
 ## Contributing
 

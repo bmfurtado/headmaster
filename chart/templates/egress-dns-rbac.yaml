@@ -1,0 +1,36 @@
+{{- if .Values.egressDns.corednsCustom }}
+# Egress DNS: the operator owns one key in kube-system/coredns-custom.
+# create cannot be constrained by resourceName, so it is granted on
+# configmaps in kube-system broadly; mutation stays pinned to the one name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "headmaster.fullname" . }}-egress-dns
+  namespace: kube-system
+  labels:
+    {{- include "headmaster.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["coredns-custom"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "headmaster.fullname" . }}-egress-dns
+  namespace: kube-system
+  labels:
+    {{- include "headmaster.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "headmaster.fullname" . }}-egress-dns
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "headmaster.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

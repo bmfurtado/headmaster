@@ -13,6 +13,9 @@ pub struct Context {
     pub proxy_image: String,
     /// socat image for the forwarder container in tailnet egress proxy pods.
     pub socat_image: String,
+    /// Maintain egress DNS rewrites in the kube-system coredns-custom
+    /// ConfigMap (k3s/AKS convention; opt-in via the chart).
+    pub egress_dns_coredns_custom: bool,
     pub operator_image: String,
     /// When true this deployment claims Ingresses that have no explicit `headscale-namespace`
     /// annotation. Only one deployment may hold `claim_default = true` at a time;

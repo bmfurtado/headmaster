@@ -65,6 +65,8 @@ spec:
               value: "{{ .Values.proxyImage.repository }}:{{ .Values.proxyImage.tag }}"
             - name: SOCAT_IMAGE
               value: "{{ .Values.socatImage.repository }}:{{ .Values.socatImage.tag }}"
+            - name: EGRESS_DNS_COREDNS_CUSTOM
+              value: {{ .Values.egressDns.corednsCustom | quote }}
             - name: RUST_LOG
               value: {{ .Values.rustLog }}
             - name: INGRESS_ENABLED

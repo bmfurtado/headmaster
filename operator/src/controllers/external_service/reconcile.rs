@@ -116,11 +116,17 @@ fn is_external_name(svc: &Service) -> bool {
     svc.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some(EXTERNAL_NAME_TYPE)
 }
 
+/// An ExternalName Service carrying our config annotation — the shape the
+/// egress controller (and the DNS sync scanning all Services) cares about.
+pub(super) fn is_egress_shape(svc: &Service) -> bool {
+    is_external_name(svc) && svc.annotations().contains_key(ANNOTATION_CONFIG)
+}
+
 async fn reconcile(svc: Arc<Service>, ctx: Arc<Context>) -> Result<Action, Error> {
     let our_finalizer = crate::finalizer(&ctx.operator_namespace);
     let has_our_finalizer = svc.finalizers().iter().any(|f| f == &our_finalizer);
 
-    let is_ours_shape = is_external_name(&svc) && svc.annotations().contains_key(ANNOTATION_CONFIG);
+    let is_ours_shape = is_egress_shape(&svc);
     if !is_ours_shape && !has_our_finalizer {
         return Ok(Action::await_change());
     }
@@ -201,6 +207,7 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
             cleanup_proxy_resources(ctx, op_ns, &names).await;
         }
         release_service(ctx, &svc_ns, &svc_name).await?;
+        super::dns::sync_egress_dns(ctx).await?;
         return Ok(Action::await_change());
     }
 
@@ -561,6 +568,8 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
             .await;
     }
 
+    super::dns::sync_egress_dns(ctx).await?;
+
     if set_tags_failed {
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
@@ -710,6 +719,7 @@ async fn cleanup(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         headscale_ref_fallback.as_deref().unwrap_or(""),
     )
     .await?;
+    super::dns::sync_egress_dns(ctx).await?;
     Ok(Action::await_change())
 }
 

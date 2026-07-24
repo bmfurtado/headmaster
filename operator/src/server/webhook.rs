@@ -451,6 +451,7 @@ mod tests {
             headscale_image: IMAGE.to_string(),
             proxy_image: "test".to_string(),
             socat_image: "test".to_string(),
+            egress_dns_coredns_custom: false,
             operator_image: "test".to_string(),
             claim_default: true,
         }

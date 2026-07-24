@@ -9,6 +9,7 @@
 //! Shares the proxy building blocks (names, auth keys, cleanup, headscale
 //! connection) with the Ingress controller via [`crate::controllers::proxy`].
 
+mod dns;
 mod reconcile;
 
 pub use reconcile::stream;
