@@ -16,8 +16,18 @@ pub mod labels {
     pub use k8s_ext::label::{APP_INSTANCE, APP_MANAGED_BY, APP_NAME};
 
     pub const MANAGED_BY_VALUE: &str = "headmaster";
+    // Historical key names: the "ingress-" prefix predates ExternalName
+    // Service proxies. Both parent kinds use these keys for their
+    // coordinates; PARENT_KIND disambiguates. The values are live as labels
+    // on deployed clusters, so the keys must not change.
     pub const INGRESS_NAME: &str = "headmaster.potatonode.github.io/ingress-name";
     pub const INGRESS_NAMESPACE: &str = "headmaster.potatonode.github.io/ingress-namespace";
+    /// Which kind of parent owns a proxy child resource: "ingress" (also the
+    /// meaning when the label is absent, for children created before this
+    /// label existed) or "service".
+    pub const PARENT_KIND: &str = "headmaster.potatonode.github.io/parent-kind";
+    pub const PARENT_KIND_INGRESS: &str = "ingress";
+    pub const PARENT_KIND_SERVICE: &str = "service";
     pub fn managed_by_selector() -> String {
         format!("{}={}", APP_MANAGED_BY, MANAGED_BY_VALUE)
     }

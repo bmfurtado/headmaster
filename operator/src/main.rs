@@ -15,6 +15,7 @@ shadow!(build);
 const HEALTH_PORT: u16 = 8080;
 
 use operator::context::Context;
+use operator::controllers::external_service;
 use operator::controllers::headscale_instance;
 use operator::controllers::ingress;
 use operator::server::health;
@@ -120,16 +121,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ns = operator_namespace.clone();
         let headscale_instance_client = client.clone();
         let ingress_client = client.clone();
+        let service_client = client.clone();
         let headscale_instance_ctx = ctx.clone();
         let ingress_ctx = ctx.clone();
+        let service_ctx = ctx.clone();
         let headscale_instance_shutdown = shutdown.clone();
         let ingress_shutdown = shutdown.clone();
+        let service_shutdown = shutdown.clone();
         async move {
             let headscale_instance_fut = headscale_instance::stream(
                 Api::namespaced(headscale_instance_client, &ns),
                 headscale_instance_ctx,
                 headscale_instance_shutdown.cancelled_owned(),
             );
+            // INGRESS_ENABLED gates both proxy controllers: they are two
+            // frontends (HTTP Ingresses, ExternalName Services) over the
+            // same proxy machinery, enabled and disabled as one unit.
             if ingress_enabled {
                 tokio::join!(
                     headscale_instance_fut,
@@ -137,6 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Api::all(ingress_client),
                         ingress_ctx,
                         ingress_shutdown.cancelled_owned()
+                    ),
+                    external_service::stream(
+                        Api::all(service_client),
+                        service_ctx,
+                        service_shutdown.cancelled_owned()
                     ),
                 );
             } else {

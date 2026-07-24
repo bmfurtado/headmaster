@@ -35,7 +35,7 @@ pub struct HeadscaleInstanceSpec {
     /// Nodes will be reachable at `<hostname>.<dns_base_domain>` via the tailnet.
     #[schemars(length(min = 1))]
     pub dns_base_domain: String,
-    /// Connection details for a headscale server running *outside* the
+    /// Connection details for a headscale server running _outside_ the
     /// cluster. When set, the operator provisions no headscale resources —
     /// it only verifies reachability and lets Ingress proxies register
     /// against the external server (via `serverUrl`). Mutually exclusive

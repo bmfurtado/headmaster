@@ -205,6 +205,54 @@ headless in this mode (it remains only as the StatefulSet's governing
 service); toggling the field on a live Ingress recreates that Service, since
 `clusterIP` is immutable.
 
+### ExternalName Services
+
+An Ingress exposes an in-cluster HTTP backend. To put something that lives
+_outside_ the cluster on the tailnet — a NAS admin UI, a database on another
+host — annotate a `Service` of `type: ExternalName` with the same config
+annotation instead:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nas
+  annotations:
+    headmaster.potatonode.github.io/config: |
+      {
+        "headscale-ref": "main",
+        "user": "k8s",
+        "hostname": "nas"
+      }
+spec:
+  type: ExternalName
+  externalName: nas.internal.example.net
+  ports:
+    - port: 5001
+```
+
+The operator provisions the same Tailscale proxy StatefulSet it builds for
+Ingresses, but its serve config raw-TCP-forwards each declared port to
+`externalName` — `nas.ts.example.com:5001` tunnels bytes straight to
+`nas.internal.example.net:5001`. No HTTP handling, no TLS termination, no
+identity headers: whatever protocol the external host speaks passes through
+unchanged, which is exactly what makes this work for non-HTTP services.
+
+Rules of the road:
+
+- Only `type: ExternalName` Services are considered; the annotation on any
+  other Service type is ignored.
+- Every `spec.ports` entry becomes a forward. Only TCP is supported
+  (tailscale serve does not forward UDP); an integer `targetPort` overrides
+  the backend port.
+- All annotation fields work as they do on Ingresses, including
+  `host-network` and `access` grants (grant destinations use a
+  `tag:hm-svc-<namespace>-<name>-<hash>` tag, so a Service and an Ingress
+  with the same name cannot collide).
+- A changed `externalName` or port list rewrites the proxy's serve config,
+  which the tailscale container picks up live — no proxy restart, no node
+  re-registration.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development environment setup and

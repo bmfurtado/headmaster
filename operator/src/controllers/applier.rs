@@ -18,7 +18,7 @@ use crate::labels;
 use crate::types::HeadscaleInstance;
 
 /// SSA helper for patching the parent object's status subresource.
-pub(super) struct Applier<'a> {
+pub(crate) struct Applier<'a> {
     pub client: &'a Client,
     pub ssa: PatchParams,
 }
@@ -62,7 +62,7 @@ impl<'a> Applier<'a> {
 /// labels (`app.kubernetes.io/name`, `instance`, `managed-by`) on every resource it
 /// applies. `component` sets `app.kubernetes.io/name` (`headscale`, `scim`, etc.).
 /// Extra labels from `spec.labels` are merged first; operator labels always win.
-pub(super) struct ChildApplier<'a> {
+pub(crate) struct ChildApplier<'a> {
     pub(super) client: &'a Client,
     ssa: PatchParams,
     pub namespace: String,
@@ -91,22 +91,22 @@ impl<'a> ChildApplier<'a> {
     ///
     /// Sets `APP_INSTANCE` to `proxy_base` so the WireGuard Service selector
     /// targets only this proxy's pods (not all proxies for the same instance).
-    /// Ingress coordinates are included in `extra_labels` so the state-Secret
-    /// watcher can map secrets back to their source Ingress.
+    /// Parent coordinates and kind are included in `extra_labels` so each
+    /// controller's state-Secret watcher can map secrets back to its own
+    /// parent objects.
     pub fn for_proxy(
         ctx: &'a Context,
         namespace: &str,
         proxy_base: &str,
         owner: &HeadscaleInstance,
-        ingress_name: &str,
-        ingress_ns: &str,
+        parent_kind: &str,
+        parent_name: &str,
+        parent_ns: &str,
     ) -> Self {
         let mut extra_labels = owner.spec.labels.clone();
-        extra_labels.insert(labels::INGRESS_NAME.to_string(), ingress_name.to_string());
-        extra_labels.insert(
-            labels::INGRESS_NAMESPACE.to_string(),
-            ingress_ns.to_string(),
-        );
+        extra_labels.insert(labels::PARENT_KIND.to_string(), parent_kind.to_string());
+        extra_labels.insert(labels::INGRESS_NAME.to_string(), parent_name.to_string());
+        extra_labels.insert(labels::INGRESS_NAMESPACE.to_string(), parent_ns.to_string());
         Self {
             client: &ctx.client,
             ssa: PatchParams::apply(&crate::field_manager(&ctx.operator_namespace)).force(),
@@ -229,7 +229,7 @@ impl<'a> ChildApplier<'a> {
 
 /// Deletes `name` from `api`, treating a 404 (already gone) as success.
 /// All other errors are returned for the caller to handle.
-pub(super) async fn delete_ignoring_404<K>(api: Api<K>, name: &str) -> Result<(), kube::Error>
+pub(crate) async fn delete_ignoring_404<K>(api: Api<K>, name: &str) -> Result<(), kube::Error>
 where
     K: Resource + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
 {

@@ -12,7 +12,7 @@
             "type": "string"
           },
           "external": {
-            "description": "Connection details for a headscale server running *outside* the\ncluster. When set, the operator provisions no headscale resources —\nit only verifies reachability and lets Ingress proxies register\nagainst the external server (via `serverUrl`). Mutually exclusive\nwith `policy`, `scim`, `extraConfig`, and `resources`: the external\nserver's configuration and ACL policy belong to whoever operates it.\n`storage` is ignored.",
+            "description": "Connection details for a headscale server running _outside_ the\ncluster. When set, the operator provisions no headscale resources —\nit only verifies reachability and lets Ingress proxies register\nagainst the external server (via `serverUrl`). Mutually exclusive\nwith `policy`, `scim`, `extraConfig`, and `resources`: the external\nserver's configuration and ACL policy belong to whoever operates it.\n`storage` is ignored.",
             "nullable": true,
             "properties": {
               "apiKeySecretRef": {

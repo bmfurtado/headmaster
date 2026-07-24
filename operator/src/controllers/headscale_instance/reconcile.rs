@@ -28,7 +28,7 @@ use super::scim::{delete_scim_if_exists, ensure_scim};
 use super::{Error, PORT_GRPC, PORT_HTTP, PORT_METRICS};
 use crate::context::Context;
 use crate::controllers::applier::{Applier, ChildApplier, delete_ignoring_404};
-use crate::controllers::ingress::headscale_connect;
+use crate::controllers::proxy::headscale_connect;
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
 use crate::types::{HeadscaleInstance, IngressAnnotations, ResourceStatus};
@@ -65,6 +65,22 @@ pub fn stream(
                 let op_ns = ns.clone();
                 move |ing| {
                     IngressAnnotations::headscale_ref(&ing)
+                        .map(|href| {
+                            ObjectRef::<HeadscaleInstance>::new(href.as_str()).within(&op_ns)
+                        })
+                        .into_iter()
+                }
+            },
+        )
+        // Annotated ExternalName Services contribute access grants exactly
+        // like Ingresses, so their changes must also trigger a policy resync.
+        .watches(
+            Api::<Service>::all(ctx.client.clone()),
+            watcher::Config::default(),
+            {
+                let op_ns = ns.clone();
+                move |svc| {
+                    IngressAnnotations::headscale_ref(&svc)
                         .map(|href| {
                             ObjectRef::<HeadscaleInstance>::new(href.as_str()).within(&op_ns)
                         })
@@ -174,6 +190,8 @@ async fn apply(obj: Arc<HeadscaleInstance>, ctx: &Context) -> Result<Action, Err
         }
         let contributing_ingresses =
             list_contributing_ingresses(&ctx.client, &name, &obj.spec.watched_namespaces).await?;
+        let contributing_services =
+            list_contributing_services(&ctx.client, &name, &obj.spec.watched_namespaces).await?;
         sync_policy(
             ctx,
             &ns,
@@ -181,6 +199,7 @@ async fn apply(obj: Arc<HeadscaleInstance>, ctx: &Context) -> Result<Action, Err
             obj.spec.policy.as_ref(),
             obj.spec.scim.is_some(),
             &contributing_ingresses,
+            &contributing_services,
         )
         .await?;
 
@@ -401,6 +420,31 @@ async fn list_contributing_ingresses(
         .filter(|ing| IngressAnnotations::headscale_ref(ing).as_deref() == Some(instance_name))
         .filter(|ing| {
             let ns = ing.namespace().unwrap_or_default();
+            watched_namespaces.iter().any(|w| w == "*" || w == &ns)
+        })
+        .collect())
+}
+
+/// Lists the ExternalName Services that carry the headmaster config annotation
+/// referencing this instance, within the watched namespaces — the Service-side
+/// counterpart of `list_contributing_ingresses`.
+async fn list_contributing_services(
+    client: &kube::Client,
+    instance_name: &str,
+    watched_namespaces: &[String],
+) -> Result<Vec<Service>, Error> {
+    let service_api = Api::<Service>::all(client.clone());
+    let all_services = service_api
+        .list(&ListParams::default())
+        .await
+        .map_err(Error::Kube)?
+        .items;
+    Ok(all_services
+        .into_iter()
+        .filter(|svc| svc.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some("ExternalName"))
+        .filter(|svc| IngressAnnotations::headscale_ref(svc).as_deref() == Some(instance_name))
+        .filter(|svc| {
+            let ns = svc.namespace().unwrap_or_default();
             watched_namespaces.iter().any(|w| w == "*" || w == &ns)
         })
         .collect())

@@ -6,13 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use headscale_client::Code;
 use headscale_client::headscale::v1::{DeleteNodeRequest, SetTagsRequest};
-use headscale_client::{AuthenticatedClient, Code};
-use k8s_ext::SecretGetExt;
-use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass, IngressClassSpec};
-use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
@@ -21,16 +18,16 @@ use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
 
-use super::auth_key::{AuthKeyStatus, ensure_auth_key};
-use super::error::Error;
-use super::names::{ProxyNames, ingress_auto_tag};
-use super::proxy::{
-    apply_proxy_rbac, apply_proxy_statefulset, apply_serve_configmap, apply_wireguard_service,
-    collect_ingress_routes, ensure_state_secret, patch_ingress_status,
-};
+use super::serve::{build_serve_json, collect_ingress_routes, patch_ingress_status};
 use super::{CONTROLLER_NAME, INGRESS_CLASS_NAME};
 use crate::context::Context;
 use crate::controllers::applier::{ChildApplier, delete_ignoring_404};
+use crate::controllers::proxy::{
+    AuthKeyStatus, Error, ProxyNames, apply_proxy_rbac, apply_proxy_statefulset,
+    apply_serve_configmap, apply_wireguard_service, cleanup_proxy_resources,
+    deregister_and_cleanup, ensure_auth_key, ensure_state_secret, headscale_connect,
+    ingress_auto_tag, namespace_is_deleting, read_secret_json, read_secret_string,
+};
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
 use crate::types::{HeadscaleInstance, IngressAnnotations, ResourceStatus};
@@ -131,6 +128,14 @@ pub fn stream(
                 labels::MANAGED_BY_VALUE
             )),
             |secret| {
+                // Absent PARENT_KIND means an ingress child from before the
+                // label existed; "service" children belong to the
+                // ExternalName Service controller.
+                match secret.labels().get(labels::PARENT_KIND) {
+                    None => {}
+                    Some(k) if k == labels::PARENT_KIND_INGRESS => {}
+                    Some(_) => return None,
+                }
                 let ingress_name = secret.labels().get(labels::INGRESS_NAME)?.clone();
                 let ingress_ns = secret.labels().get(labels::INGRESS_NAMESPACE)?.clone();
                 Some(ObjectRef::<Ingress>::new(&ingress_name).within(&ingress_ns))
@@ -150,7 +155,7 @@ pub fn stream(
                     .state()
                     .into_iter()
                     .filter(move |ing| {
-                        IngressAnnotations::headscale_ref(ing).as_deref() == Some(&instance_name)
+                        IngressAnnotations::headscale_ref(&**ing).as_deref() == Some(&instance_name)
                     })
                     .map(|ing| ObjectRef::from_obj(&*ing))
             },
@@ -192,7 +197,7 @@ async fn reconcile(ingress: Arc<Ingress>, ctx: Arc<Context>) -> Result<Action, E
     let ns = ingress.namespace().ok_or(Error::MissingNamespace)?;
 
     // Layer 1: sharding gate — only adopt Ingresses targeted at this deployment.
-    let target_namespace = IngressAnnotations::headscale_namespace(&ingress);
+    let target_namespace = IngressAnnotations::headscale_namespace(&*ingress);
     let is_ours = match &target_namespace {
         Some(n) => n == &ctx.operator_namespace,
         None => ctx.claim_default,
@@ -208,7 +213,7 @@ async fn reconcile(ingress: Arc<Ingress>, ctx: Arc<Context>) -> Result<Action, E
     // we immediately remove would block re-adoption when watchedNamespaces is later
     // updated to include this namespace.
     if !has_our_finalizer {
-        match IngressAnnotations::parse(&ingress) {
+        match IngressAnnotations::parse(&*ingress) {
             Ok(annotations) => {
                 let instance_api: Api<HeadscaleInstance> =
                     Api::namespaced(ctx.client.clone(), &ctx.operator_namespace);
@@ -269,8 +274,9 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         });
     if class != Some(INGRESS_CLASS_NAME) {
         let names = ProxyNames::new(&ingress_ns, &ingress_name);
-        if let Some(headscale_ref) = IngressAnnotations::headscale_ref(&ingress) {
-            deregister_and_cleanup(ctx, op_ns, &names, &ingress, &headscale_ref).await?;
+        if let Some(headscale_ref) = IngressAnnotations::headscale_ref(&*ingress) {
+            deregister_and_cleanup(ctx, op_ns, &names, &ingress.object_ref(&()), &headscale_ref)
+                .await?;
         } else {
             cleanup_proxy_resources(ctx, op_ns, &names).await;
         }
@@ -280,15 +286,16 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
 
     // Sharding release: if the headscale-namespace annotation now points
     // elsewhere, deregister resources and relinquish ownership.
-    let target_namespace = IngressAnnotations::headscale_namespace(&ingress);
+    let target_namespace = IngressAnnotations::headscale_namespace(&*ingress);
     let is_ours = match &target_namespace {
         Some(n) => n == op_ns,
         None => ctx.claim_default,
     };
     if !is_ours {
         let names = ProxyNames::new(&ingress_ns, &ingress_name);
-        if let Some(headscale_ref) = IngressAnnotations::headscale_ref(&ingress) {
-            deregister_and_cleanup(ctx, op_ns, &names, &ingress, &headscale_ref).await?;
+        if let Some(headscale_ref) = IngressAnnotations::headscale_ref(&*ingress) {
+            deregister_and_cleanup(ctx, op_ns, &names, &ingress.object_ref(&()), &headscale_ref)
+                .await?;
         } else {
             cleanup_proxy_resources(ctx, op_ns, &names).await;
         }
@@ -296,7 +303,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         return Ok(Action::await_change());
     }
 
-    let annotations = IngressAnnotations::parse(&ingress)?;
+    let annotations = IngressAnnotations::parse(&*ingress)?;
 
     if namespace_is_deleting(&ctx.client, &ingress_ns).await? {
         tracing::info!(
@@ -346,7 +353,14 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
                 ),
             )
             .await;
-        deregister_and_cleanup(ctx, op_ns, &names, &ingress, &annotations.headscale_ref).await?;
+        deregister_and_cleanup(
+            ctx,
+            op_ns,
+            &names,
+            &ingress.object_ref(&()),
+            &annotations.headscale_ref,
+        )
+        .await?;
         release_ingress(ctx, &ingress_ns, &ingress_name).await?;
         return Ok(Action::await_change());
     }
@@ -384,6 +398,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         op_ns,
         &names.proxy_base,
         &instance,
+        labels::PARENT_KIND_INGRESS,
         &ingress_name,
         &ingress_ns,
     );
@@ -428,8 +443,14 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
                     "Ingress has no HTTP path rules; add spec.rules with at least one backend",
                 )
                 .await;
-            deregister_and_cleanup(ctx, op_ns, &names, &ingress, &annotations.headscale_ref)
-                .await?;
+            deregister_and_cleanup(
+                ctx,
+                op_ns,
+                &names,
+                &ingress.object_ref(&()),
+                &annotations.headscale_ref,
+            )
+            .await?;
             return Ok(Action::await_change());
         }
         Ok(routes) if routes.is_empty() => {
@@ -498,7 +519,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
     if let AuthKeyStatus::WaitingForUser = ensure_auth_key(
         ctx,
         op_ns,
-        &ingress,
+        &ingress.object_ref(&()),
         &mut headscale,
         &child,
         &names,
@@ -515,7 +536,8 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
 
     let state_secret = ensure_state_secret(&child, &names, &annotations.headscale_ref).await?;
 
-    apply_serve_configmap(&child, &names, &tailnet_fqdn, &routes, &cap_names).await?;
+    let serve_json = build_serve_json(&tailnet_fqdn, &routes, &cap_names);
+    apply_serve_configmap(&child, &names, &serve_json).await?;
 
     apply_proxy_rbac(&child, &names).await?;
 
@@ -550,22 +572,20 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         .collect();
     if let Some(node_id) = device_id.as_ref().and_then(|s| s.parse::<u64>().ok())
         && !desired_tags.is_empty()
-    {
-        if let Err(e) = headscale
+        && let Err(e) = headscale
             .set_tags(SetTagsRequest {
                 node_id,
                 tags: desired_tags,
             })
             .await
-        {
-            tracing::warn!(
-                name = ingress_name,
-                node_id,
-                error = %e,
-                "failed to set ACL tags on headscale node; will retry on next reconcile"
-            );
-            set_tags_failed = true;
-        }
+    {
+        tracing::warn!(
+            name = ingress_name,
+            node_id,
+            error = %e,
+            "failed to set ACL tags on headscale node; will retry on next reconcile"
+        );
+        set_tags_failed = true;
     }
 
     if device_id.is_some() {
@@ -636,161 +656,16 @@ async fn cleanup(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> 
     let ingress_name = ingress.name_any();
     let op_ns = &ctx.operator_namespace;
     let names = ProxyNames::new(&ingress_ns, &ingress_name);
-    let headscale_ref_fallback = IngressAnnotations::headscale_ref(&ingress);
+    let headscale_ref_fallback = IngressAnnotations::headscale_ref(&*ingress);
     deregister_and_cleanup(
         ctx,
         op_ns,
         &names,
-        &ingress,
+        &ingress.object_ref(&()),
         headscale_ref_fallback.as_deref().unwrap_or(""),
     )
     .await?;
     Ok(Action::await_change())
-}
-
-/// Deregisters the proxy's headscale node (if registered) and deletes all proxy
-/// k8s resources. Called on both Ingress deletion and namespace exclusion.
-///
-/// State secret read errors are propagated so the caller requeues and retries,
-/// ensuring the node is removed before k8s resources are cleaned up. All other
-/// errors (headscale connection, node deletion, k8s resource deletion) are
-/// best-effort: logged or published as events, then cleanup continues.
-async fn deregister_and_cleanup(
-    ctx: &Context,
-    op_ns: &str,
-    names: &ProxyNames,
-    ingress: &Ingress,
-    headscale_ref_fallback: &str,
-) -> Result<(), Error> {
-    let ingress_name = ingress.name_any();
-
-    // Read node_id and headscale_ref from the state Secret. On non-404 errors
-    // we propagate and requeue — this retries until the API recovers, ensuring
-    // the headscale node is deleted before k8s resources are cleaned up.
-    let state_secret = match Api::<Secret>::namespaced(ctx.client.clone(), op_ns)
-        .get(&names.state_secret_name)
-        .await
-    {
-        Ok(secret) => Some(secret),
-        Err(kube::Error::Api(ref e)) if e.code == 404 => None,
-        Err(e) => return Err(Error::Kube(e)),
-    };
-
-    let node_id = state_secret
-        .as_ref()
-        .and_then(|s| read_secret_string(s, "device_id"))
-        .and_then(|s| s.parse::<u64>().ok());
-
-    if let Some(id) = node_id {
-        let headscale_ref = state_secret
-            .as_ref()
-            .and_then(|s| read_secret_string(s, "headscale_ref"))
-            .unwrap_or_else(|| headscale_ref_fallback.to_string());
-        match headscale_connect(ctx, op_ns, &headscale_ref).await {
-            Err(e) => {
-                let recorder = ctx.recorder();
-                let _ = recorder
-                    .publish_warning(
-                        &ingress.object_ref(&()),
-                        "NodeOrphaned",
-                        &format!(
-                            "could not connect to headscale to delete node {id}: {e}; \
-                             the node may remain registered in headscale"
-                        ),
-                    )
-                    .await;
-            }
-            Ok(mut headscale) => {
-                match headscale
-                    .delete_node(DeleteNodeRequest { node_id: id })
-                    .await
-                {
-                    Ok(_) => tracing::debug!(
-                        name = ingress_name,
-                        node_id = id,
-                        "deleted node from headscale"
-                    ),
-                    Err(e) if e.code() == Code::NotFound => tracing::debug!(
-                        name = ingress_name,
-                        "cleanup: node already gone from headscale"
-                    ),
-                    Err(e) => {
-                        // Return an error so the finalizer stays in place and
-                        // the reconciler retries. The state Secret must not be
-                        // deleted until we have confirmed headscale no longer
-                        // tracks the node — it holds the node_id we need to
-                        // retry the deletion.
-                        tracing::warn!(
-                            name = ingress_name,
-                            node_id = id,
-                            error = %e,
-                            "cleanup: failed to delete node from headscale; will retry"
-                        );
-                        return Err(Error::HeadscaleApi(e));
-                    }
-                }
-                let recorder = ctx.recorder();
-                let _ = recorder.publish_deleted(&ingress.object_ref(&())).await;
-            }
-        }
-    }
-
-    cleanup_proxy_resources(ctx, op_ns, names).await;
-    Ok(())
-}
-
-/// Explicitly deletes all proxy resources created in the operator namespace.
-///
-/// Proxy resources are owned by their HeadscaleInstance (same namespace), so GC
-/// handles cleanup on HeadscaleInstance deletion. For Ingress deletion the owner
-/// is still alive, so this explicit cleanup is still required.
-/// All deletes are best-effort: 404s are silently ignored; unexpected errors are
-/// logged so leaked resources are discoverable, but cleanup continues regardless.
-async fn cleanup_proxy_resources(ctx: &Context, op_ns: &str, names: &ProxyNames) {
-    let c = ctx.client.clone();
-    tokio::join!(
-        del_warn(
-            Api::<StatefulSet>::namespaced(c.clone(), op_ns),
-            &names.proxy_name
-        ),
-        del_warn(
-            Api::<Service>::namespaced(c.clone(), op_ns),
-            &names.wg_service_name
-        ),
-        del_warn(
-            Api::<Secret>::namespaced(c.clone(), op_ns),
-            &names.config_secret_name
-        ),
-        del_warn(
-            Api::<Secret>::namespaced(c.clone(), op_ns),
-            &names.state_secret_name
-        ),
-        del_warn(
-            Api::<ConfigMap>::namespaced(c.clone(), op_ns),
-            &names.serve_configmap_name
-        ),
-        del_warn(
-            Api::<RoleBinding>::namespaced(c.clone(), op_ns),
-            &names.proxy_name
-        ),
-        del_warn(Api::<Role>::namespaced(c.clone(), op_ns), &names.proxy_name),
-        del_warn(
-            Api::<ServiceAccount>::namespaced(c, op_ns),
-            &names.proxy_name
-        ),
-    );
-}
-
-/// Best-effort delete used by `cleanup_proxy_resources`: 404 is success,
-/// any other error is logged and swallowed so the parallel cleanup of the
-/// remaining resources continues.
-async fn del_warn<K>(api: Api<K>, name: &str)
-where
-    K: Resource + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
-{
-    if let Err(e) = delete_ignoring_404(api, name).await {
-        tracing::warn!(resource = name, error = %e, "cleanup: failed to delete proxy resource");
-    }
 }
 
 /// Removes our finalizer from the Ingress and clears the `claimed-by` annotation
@@ -850,85 +725,11 @@ async fn release_ingress(ctx: &Context, ingress_ns: &str, ingress_name: &str) ->
     Ok(())
 }
 
-// ── headscale connection ──────────────────────────────────────────────────────
-
-pub(crate) async fn headscale_connect(
-    ctx: &Context,
-    namespace: &str,
-    name: &str,
-) -> Result<AuthenticatedClient, kube::Error> {
-    // External instances carry their own gRPC endpoint and API-key Secret;
-    // managed instances use the in-cluster service and the bootstrap-created
-    // Secret. A 404 on the instance GET propagates exactly like the managed
-    // path's missing-secret 404, which callers already treat as "instance
-    // gone" during cleanup.
-    let instance = Api::<HeadscaleInstance>::namespaced(ctx.client.clone(), namespace)
-        .get(name)
-        .await?;
-    let (endpoint, secret_name) = match &instance.spec.external {
-        Some(ext) => (ext.grpc_endpoint.clone(), ext.api_key_secret_ref.clone()),
-        None => (
-            format!("http://headscale-server-{name}.{namespace}.svc:50443"),
-            format!("headscale-api-key-{name}"),
-        ),
-    };
-    let api_key = Api::<Secret>::namespaced(ctx.client.clone(), namespace)
-        .get(&secret_name)
-        .await
-        .map_err(|e| match e {
-            kube::Error::Api(ref ae) if ae.code == 404 => kube::Error::Api(Box::new(
-                kube::error::Status::failure(
-                    &format!("Secret {secret_name} not found; is HeadscaleInstance ready?"),
-                    "NotFound",
-                )
-                .with_code(404),
-            )),
-            other => other,
-        })?
-        .data
-        .as_ref()
-        .and_then(|d| d.get("HEADSCALE_API_KEY"))
-        .map(|b| String::from_utf8_lossy(&b.0).into_owned())
-        .ok_or_else(|| {
-            kube::Error::Api(Box::new(
-                kube::error::Status::failure(
-                    "api-key secret has no 'HEADSCALE_API_KEY' field",
-                    "InvalidSecret",
-                )
-                .with_code(500),
-            ))
-        })?;
-    ctx.headscale
-        .connect(&endpoint, &api_key)
-        .await
-        .map_err(|e| kube::Error::Service(Box::new(e)))
-}
-
-// ── namespace helper ──────────────────────────────────────────────────────────
-
-async fn namespace_is_deleting(client: &Client, ns: &str) -> Result<bool, Error> {
-    match Api::<Namespace>::all(client.clone()).get(ns).await {
-        Ok(ns_obj) => Ok(ns_obj.metadata.deletion_timestamp.is_some()),
-        Err(kube::Error::Api(ref e)) if e.code == 404 => Ok(true),
-        Err(e) => Err(Error::Kube(e)),
-    }
-}
-
-// ── secret helpers ────────────────────────────────────────────────────────────
-
-fn read_secret_string(secret: &Secret, key: &str) -> Option<String> {
-    String::from_utf8(secret.item(key)?.0.clone()).ok()
-}
-
-fn read_secret_json<T: serde::de::DeserializeOwned>(secret: &Secret, key: &str) -> Option<T> {
-    serde_json::from_slice(&secret.item(key)?.0).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controllers::ingress::test_support::{headmaster_ingress, test_ctx, test_ingress};
-    use crate::test_support::{FaultService, all_404, all_500};
+    use crate::controllers::ingress::test_support::{headmaster_ingress, test_ctx};
+    use crate::test_support::{FaultService, all_500};
 
     // ── ensure_ingress_class tests ────────────────────────────────────────────
 
@@ -1000,57 +801,6 @@ mod tests {
         assert_eq!(
             patch_count, 1,
             "only the spec PATCH must be issued; claim must not be touched"
-        );
-    }
-
-    // ── namespace_is_deleting tests ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn namespace_is_deleting_returns_true_on_404() {
-        let client = FaultService::client(all_404);
-        let result = namespace_is_deleting(&client, "gone-ns").await.unwrap();
-        assert!(
-            result,
-            "404 on namespace GET must be treated as namespace gone (deleting)"
-        );
-    }
-
-    #[tokio::test]
-    async fn namespace_is_deleting_propagates_non_404_error() {
-        let client = FaultService::client(all_500);
-        let result = namespace_is_deleting(&client, "any-ns").await;
-        assert!(result.is_err(), "non-404 GET error must propagate");
-    }
-
-    // ── deregister_and_cleanup tests ──────────────────────────────────────────
-
-    #[tokio::test]
-    async fn deregister_and_cleanup_propagates_state_secret_error() {
-        let (k8s, calls) = FaultService::tracked(all_500);
-        let ctx = test_ctx(k8s);
-        let names = ProxyNames::new("default", "test-ingress");
-
-        let result = deregister_and_cleanup(&ctx, "default", &names, &test_ingress(), "main").await;
-
-        assert!(result.is_err(), "state-secret GET error must propagate");
-        let recorded = calls.lock().unwrap();
-        assert!(
-            recorded.iter().all(|(m, _)| m == "GET"),
-            "no DELETE calls must be issued when state-secret read fails: {recorded:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn deregister_and_cleanup_continues_when_state_secret_absent() {
-        // all_404: state-secret GET → 404 (None), proxy resource DELETEs → 404 (silently ignored).
-        let ctx = test_ctx(FaultService::client(all_404));
-        let names = ProxyNames::new("default", "test-ingress");
-
-        let result = deregister_and_cleanup(&ctx, "default", &names, &test_ingress(), "main").await;
-
-        assert!(
-            result.is_ok(),
-            "missing state secret must not abort cleanup"
         );
     }
 

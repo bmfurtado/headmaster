@@ -1,4 +1,4 @@
-//! Manages the headscale pre-auth key lifecycle for ingress proxy registration.
+//! Manages the headscale pre-auth key lifecycle for proxy registration.
 //! Creates a short-lived key before the proxy pod starts, and revokes the old
 //! key when the proxy re-registers (the new key is only needed until the proxy
 //! joins the tailnet for the first time).
@@ -11,9 +11,8 @@ use headscale_client::headscale::v1::{
 use headscale_client::{AuthenticatedClient, Status};
 use k8s_ext::{SecretExt, SecretGetExt};
 use k8s_openapi::ByteString;
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::api::core::v1::Secret;
-use k8s_openapi::api::networking::v1::Ingress;
-use kube::Resource;
 use kube::api::Api;
 use prost_types::Timestamp;
 
@@ -26,7 +25,7 @@ use crate::controllers::recorder::RecorderExt;
 /// Outcome of `ensure_auth_key`: either the key is available and provisioning
 /// can continue, or the required headscale user doesn't exist yet.
 #[derive(Debug, PartialEq)]
-pub(super) enum AuthKeyStatus {
+pub(crate) enum AuthKeyStatus {
     Ready,
     WaitingForUser,
 }
@@ -43,10 +42,10 @@ pub(super) enum AuthKeyStatus {
 /// Kubernetes in a single function. If the Kubernetes save fails, the key is
 /// deleted from headscale to avoid leaking it.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn ensure_auth_key(
+pub(crate) async fn ensure_auth_key(
     ctx: &Context,
     ns: &str,
-    ingress: &Ingress,
+    parent_ref: &ObjectReference,
     headscale: &mut AuthenticatedClient,
     child: &ChildApplier<'_>,
     names: &ProxyNames,
@@ -86,11 +85,11 @@ pub(super) async fn ensure_auth_key(
                 let recorder = ctx.recorder();
                 let _ = recorder
                     .publish_warning(
-                        &ingress.object_ref(&()),
+                        parent_ref,
                         "UserNotFound",
                         &format!(
                             "headscale user '{user_name}' does not exist; \
-                             create it in headscale before this Ingress can be provisioned"
+                             create it in headscale before this proxy can be provisioned"
                         ),
                     )
                     .await;
@@ -142,7 +141,7 @@ pub(super) async fn ensure_auth_key(
     Ok(AuthKeyStatus::Ready)
 }
 
-pub(super) async fn existing_auth_key(
+pub(crate) async fn existing_auth_key(
     ctx: &Context,
     ns: &str,
     config_secret_name: &str,
@@ -172,7 +171,7 @@ async fn apply_config_secret(
     Ok(())
 }
 
-pub(super) fn extract_auth_key(secret: &Secret) -> Option<String> {
+pub(crate) fn extract_auth_key(secret: &Secret) -> Option<String> {
     let key = String::from_utf8(secret.item("key")?.0.clone()).ok()?;
     if key.is_empty() { None } else { Some(key) }
 }
@@ -186,6 +185,7 @@ mod tests {
     use headscale_client::HeadscaleServiceClient;
     use headscale_client::fake::{FakeHeadscaleServer, spawn_fake_channel};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube::Resource;
     use std::sync::Arc;
 
     fn patch_500_else_404(m: &http::Method, _: &str) -> (u16, Vec<u8>) {
@@ -240,7 +240,7 @@ mod tests {
         let result = ensure_auth_key(
             &ctx,
             "default",
-            &test_ingress(),
+            &test_ingress().object_ref(&()),
             &mut headscale,
             &child,
             &names,
@@ -274,7 +274,7 @@ mod tests {
         let result = ensure_auth_key(
             &ctx,
             "default",
-            &test_ingress(),
+            &test_ingress().object_ref(&()),
             &mut headscale,
             &child,
             &names,
@@ -311,7 +311,7 @@ mod tests {
         let result = ensure_auth_key(
             &ctx,
             "default",
-            &test_ingress(),
+            &test_ingress().object_ref(&()),
             &mut headscale,
             &child,
             &names,
@@ -368,7 +368,7 @@ mod tests {
         let result = ensure_auth_key(
             &ctx,
             "default",
-            &test_ingress(),
+            &test_ingress().object_ref(&()),
             &mut headscale,
             &child,
             &names,
@@ -405,7 +405,7 @@ mod tests {
         let result = ensure_auth_key(
             &ctx,
             "default",
-            &test_ingress(),
+            &test_ingress().object_ref(&()),
             &mut headscale,
             &child,
             &names,

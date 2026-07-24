@@ -10,7 +10,7 @@ use kube::runtime::events::Reporter;
 use super::INGRESS_CLASS_NAME;
 use crate::context::Context;
 
-pub(super) fn test_ctx(client: kube::Client) -> Context {
+pub(crate) fn test_ctx(client: kube::Client) -> Context {
     Context {
         client,
         operator_namespace: "default".to_string(),
@@ -26,7 +26,7 @@ pub(super) fn test_ctx(client: kube::Client) -> Context {
     }
 }
 
-pub(super) fn test_ingress() -> Ingress {
+pub(crate) fn test_ingress() -> Ingress {
     Ingress {
         metadata: ObjectMeta {
             name: Some("test-ingress".to_string()),
@@ -38,7 +38,7 @@ pub(super) fn test_ingress() -> Ingress {
     }
 }
 
-pub(super) fn headmaster_ingress(namespace: &str) -> Ingress {
+pub(crate) fn headmaster_ingress(namespace: &str) -> Ingress {
     Ingress {
         metadata: ObjectMeta {
             name: Some("test-ingress".to_string()),

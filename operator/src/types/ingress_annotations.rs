@@ -1,9 +1,10 @@
-//! Parsed representation of the `headmaster.potatonode.github.io/config` annotation
-//! on `Ingress` objects.
+//! Parsed representation of the `headmaster.potatonode.github.io/config` annotation.
+//! Carried by `Ingress` objects (HTTP apps behind a proxy) and by ExternalName
+//! `Service` objects (TCP forwards to an external host); the schema is shared,
+//! so the parser is generic over the annotated resource.
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::networking::v1::Ingress;
 use kube::ResourceExt;
 use serde::Deserialize;
 
@@ -71,8 +72,8 @@ pub struct IngressAnnotations {
 }
 
 impl IngressAnnotations {
-    pub fn parse(ingress: &Ingress) -> Result<Self, AnnotationError> {
-        let json = ingress
+    pub fn parse<K: ResourceExt>(obj: &K) -> Result<Self, AnnotationError> {
+        let json = obj
             .annotations()
             .get(ANNOTATION_CONFIG)
             .ok_or(AnnotationError::Missing(ANNOTATION_CONFIG))?;
@@ -84,15 +85,15 @@ impl IngressAnnotations {
             ));
         }
         if parsed.hostname.is_empty() {
-            parsed.hostname = ingress.name_any();
+            parsed.hostname = obj.name_any();
         }
         Ok(parsed)
     }
 
     /// Cheaply extracts `headscale-ref` without full validation. Used in
     /// contexts where `parse()` hasn't run (watch triggers, pre-finalizer gate).
-    pub fn headscale_ref(ingress: &Ingress) -> Option<String> {
-        let json = ingress.annotations().get(ANNOTATION_CONFIG)?;
+    pub fn headscale_ref<K: ResourceExt>(obj: &K) -> Option<String> {
+        let json = obj.annotations().get(ANNOTATION_CONFIG)?;
         serde_json::from_str::<serde_json::Value>(json)
             .ok()
             .and_then(|v| v.get("headscale-ref")?.as_str().map(String::from))
@@ -100,8 +101,8 @@ impl IngressAnnotations {
 
     /// Cheaply extracts `headscale-namespace` without full validation. Used in
     /// the sharding gate before `parse()` runs.
-    pub fn headscale_namespace(ingress: &Ingress) -> Option<String> {
-        let json = ingress.annotations().get(ANNOTATION_CONFIG)?;
+    pub fn headscale_namespace<K: ResourceExt>(obj: &K) -> Option<String> {
+        let json = obj.annotations().get(ANNOTATION_CONFIG)?;
         serde_json::from_str::<serde_json::Value>(json)
             .ok()
             .and_then(|v| v.get("headscale-namespace")?.as_str().map(String::from))
@@ -111,6 +112,7 @@ impl IngressAnnotations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::networking::v1::Ingress;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
     fn make_test_ingress(user: Option<&str>, tags: Option<&[&str]>) -> Ingress {
