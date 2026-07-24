@@ -984,21 +984,13 @@ async fn adding_access_to_existing_ingress_updates_node_tags() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Simulate the proxy registering with headscale (device_id = 42).
+    // Simulate the proxy registering with headscale (device_id = 42). No
+    // set_tags call is expected yet: this Ingress has no tags and no access
+    // grants, and the operator skips SetTags for tag-less proxies (headscale
+    // rejects an empty tag list). The reconcile triggered by the annotation
+    // patch below reads this state secret, so no extra synchronisation is
+    // needed here.
     populate_state_secret(&kube_client, &ns, &ns, "my-ingress", "42", &["100.64.0.5"]).await;
-
-    // Wait for the first set_tags call (no access → empty tags on node 42).
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if state.lock().unwrap().node_tags.contains_key(&42) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out: set_tags was not called after proxy registered"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 
     // Now add an access grant — simulates the user patching the Ingress after
     // the proxy was already running.
