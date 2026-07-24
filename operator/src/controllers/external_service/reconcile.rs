@@ -17,8 +17,8 @@ use k8s_ext::{
 };
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, PodSecurityContext, PodSpec, PodTemplateSpec, SeccompProfile,
-    Secret, Service, ServicePort, ServiceSpec,
+    ConfigMap, Container, ContainerPort, EnvVar, PodSecurityContext, PodSpec, PodTemplateSpec,
+    SeccompProfile, Secret, Service, ServicePort, ServiceSpec,
 };
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
@@ -55,7 +55,32 @@ pub fn stream(
 ) -> impl std::future::Future<Output = ()> {
     let controller = kube::runtime::Controller::new(service_api, watcher::Config::default());
     let service_store = controller.store();
+    let dns_store = service_store.clone();
+    let dns_enabled = ctx.egress_dns_coredns_custom;
     controller
+        .watches(
+            // The coredns-custom ConfigMap the DNS sync owns a key in: if
+            // anything outside the operator changes or deletes it (GitOps
+            // prune, manual kubectl), re-reconcile every egress Service so
+            // the next sync restores the override. Without this, a deleted
+            // ConfigMap silently breaks egress DNS until an unrelated event.
+            Api::<ConfigMap>::namespaced(ctx.client.clone(), super::dns::COREDNS_CUSTOM_NAMESPACE),
+            watcher::Config::default().fields(&format!(
+                "metadata.name={}",
+                super::dns::COREDNS_CUSTOM_NAME
+            )),
+            move |_cm| {
+                if !dns_enabled {
+                    return Vec::new();
+                }
+                dns_store
+                    .state()
+                    .into_iter()
+                    .filter(|svc| is_egress_shape(svc))
+                    .map(|svc| ObjectRef::from_obj(&*svc))
+                    .collect::<Vec<_>>()
+            },
+        )
         .watches(
             Api::<Secret>::namespaced(ctx.client.clone(), &ctx.operator_namespace),
             watcher::Config::default().labels(&format!(

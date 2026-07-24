@@ -20,8 +20,8 @@ use crate::controllers::proxy::{Error, ProxyNames};
 use crate::controllers::recorder::RecorderExt;
 use crate::types::IngressAnnotations;
 
-const COREDNS_CUSTOM_NAMESPACE: &str = "kube-system";
-const COREDNS_CUSTOM_NAME: &str = "coredns-custom";
+pub(super) const COREDNS_CUSTOM_NAMESPACE: &str = "kube-system";
+pub(super) const COREDNS_CUSTOM_NAME: &str = "coredns-custom";
 const OVERRIDE_KEY: &str = "headmaster-egress.override";
 
 /// Regenerates the CoreDNS override from the full set of egress Services
