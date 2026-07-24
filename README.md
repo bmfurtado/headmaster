@@ -175,6 +175,36 @@ reconcile applies the grant automatically.
 
 The admission webhook validates that each access grant's `from` list is non-empty.
 
+### Host-network proxies
+
+By default a proxy runs on the pod network: tailscaled is pinned to UDP
+41641 in-pod, a NodePort Service exposes it, and the node's LAN endpoint is
+advertised (`TS_DEBUG_PRETENDPOINT`) so LAN peers can connect directly.
+Off-LAN peers usually cannot — the advertised address is private, and the
+pod-SNAT + site-NAT stack defeats hole punching — so they fall back to DERP.
+
+Setting `"host-network": true` on the annotation runs the proxy pod with
+`hostNetwork: true` instead. tailscaled binds the node's own network stack on
+an auto-selected UDP port and discovers its endpoints natively — including
+the node's global IPv6 addresses, which is what makes direct connections
+from IPv6-capable peers (e.g. phones on cellular) possible:
+
+```yaml
+annotations:
+  headmaster.potatonode.github.io/config: |
+    {
+      "headscale-ref": "main",
+      "user": "alice",
+      "host-network": true
+    }
+```
+
+The trade-off is the pod's network isolation: the proxy shares the node's
+network namespace and bypasses NetworkPolicies. The WireGuard Service turns
+headless in this mode (it remains only as the StatefulSet's governing
+service); toggling the field on a live Ingress recreates that Service, since
+`clusterIP` is immutable.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development environment setup and

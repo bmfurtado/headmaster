@@ -59,6 +59,13 @@ pub struct IngressAnnotations {
     pub auth_key_expiry_secs: u64,
     #[serde(default)]
     pub auth_key_reusable: bool,
+    /// Run the proxy pod with `hostNetwork: true`. tailscaled then binds the
+    /// node's own network stack on an auto-selected UDP port and discovers
+    /// its endpoints natively — the node's IPv6 addresses included — instead
+    /// of advertising the WireGuard NodePort. Trades the pod's network
+    /// isolation for direct peer connections from off-LAN devices.
+    #[serde(default)]
+    pub host_network: bool,
     #[serde(default)]
     pub access: Vec<IngressAccessGrant>,
 }
@@ -210,6 +217,23 @@ mod tests {
         let ingress = ingress_with_config(serde_json::json!({}));
         let parsed = IngressAnnotations::parse(&ingress).expect("must parse without expiry");
         assert_eq!(parsed.auth_key_expiry_secs, DEFAULT_AUTH_KEY_EXPIRY_SECS);
+    }
+
+    #[test]
+    fn annotation_parse_host_network_defaults_false_when_absent() {
+        let ingress = ingress_with_config(serde_json::json!({}));
+        let parsed = IngressAnnotations::parse(&ingress).expect("must parse without host-network");
+        assert!(
+            !parsed.host_network,
+            "host-network must default to false when the field is omitted"
+        );
+    }
+
+    #[test]
+    fn annotation_parse_host_network_true_is_respected() {
+        let ingress = ingress_with_config(serde_json::json!({"host-network": true}));
+        let parsed = IngressAnnotations::parse(&ingress).expect("must parse with host-network");
+        assert!(parsed.host_network);
     }
 
     #[test]

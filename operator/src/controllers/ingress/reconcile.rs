@@ -448,7 +448,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
 
     let mut headscale = headscale_connect(ctx, op_ns, &annotations.headscale_ref).await?;
 
-    let wg_node_port = apply_wireguard_service(&child, &names).await?;
+    let networking = apply_wireguard_service(&child, &names, annotations.host_network).await?;
 
     // If headscale_ref changed, deregister from old HI and reset secrets before ensure_auth_key.
     let retarget = match Api::<Secret>::namespaced(ctx.client.clone(), op_ns)
@@ -525,7 +525,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         &ctx.proxy_image,
         &login_url,
         &annotations.hostname,
-        wg_node_port,
+        &networking,
     )
     .await?;
 
