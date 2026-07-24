@@ -63,6 +63,8 @@ spec:
               value: "{{ .Values.headscaleImage.repository }}:{{ .Values.headscaleImage.tag }}"
             - name: PROXY_IMAGE
               value: "{{ .Values.proxyImage.repository }}:{{ .Values.proxyImage.tag }}"
+            - name: SOCAT_IMAGE
+              value: "{{ .Values.socatImage.repository }}:{{ .Values.socatImage.tag }}"
             - name: RUST_LOG
               value: {{ .Values.rustLog }}
             - name: INGRESS_ENABLED

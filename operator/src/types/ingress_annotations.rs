@@ -65,8 +65,16 @@ pub struct IngressAnnotations {
     /// its endpoints natively — the node's IPv6 addresses included — instead
     /// of advertising the WireGuard NodePort. Trades the pod's network
     /// isolation for direct peer connections from off-LAN devices.
+    /// Ignored on ExternalName Services (egress proxies).
     #[serde(default)]
     pub host_network: bool,
+    /// Tailnet FQDN an ExternalName Service egresses to (e.g.
+    /// `qbittorrent.ts.example.com`). Required on ExternalName Services,
+    /// rejected on Ingresses. The operator owns `spec.externalName` on the
+    /// annotated Service and points it at the egress proxy; this field is the
+    /// actual tailnet destination.
+    #[serde(default)]
+    pub tailnet_fqdn: Option<String>,
     #[serde(default)]
     pub access: Vec<IngressAccessGrant>,
 }

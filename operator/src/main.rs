@@ -47,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let headscale_image =
         std::env::var("HEADSCALE_IMAGE").expect("HEADSCALE_IMAGE env var must be set");
     let proxy_image = std::env::var("PROXY_IMAGE").expect("PROXY_IMAGE env var must be set");
+    let socat_image = std::env::var("SOCAT_IMAGE").expect("SOCAT_IMAGE env var must be set");
     let operator_image =
         std::env::var("OPERATOR_IMAGE").expect("OPERATOR_IMAGE env var must be set");
 
@@ -97,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         headscale_image,
         proxy_image,
+        socat_image,
         operator_image,
         claim_default,
     });

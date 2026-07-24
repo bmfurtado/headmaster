@@ -205,53 +205,58 @@ headless in this mode (it remains only as the StatefulSet's governing
 service); toggling the field on a live Ingress recreates that Service, since
 `clusterIP` is immutable.
 
-### ExternalName Services
+### Tailnet egress: reaching tailnet hosts from pods
 
-An Ingress exposes an in-cluster HTTP backend. To put something that lives
-_outside_ the cluster on the tailnet — a NAS admin UI, a database on another
-host — annotate a `Service` of `type: ExternalName` with the same config
-annotation instead:
+An Ingress puts an in-cluster app _on_ the tailnet. The reverse also comes
+up: an in-cluster pod needs to reach something that lives on the tailnet — a
+download client on a seedbox, a NAS UI, an admin API on another host. Pod
+traffic normally leaves masqueraded as the node's identity, which a
+default-deny ACL rightly blocks. For this, annotate a `Service` of
+`type: ExternalName` with the config annotation plus a `tailnet-fqdn`:
 
 ```yaml
 apiVersion: v1
 kind: Service
 metadata:
-  name: nas
+  name: qbittorrent
   annotations:
     headmaster.potatonode.github.io/config: |
       {
         "headscale-ref": "main",
-        "user": "k8s",
-        "hostname": "nas"
+        "managed-key-tags": ["tag:egress"],
+        "hostname": "egress-qbittorrent",
+        "tailnet-fqdn": "qbittorrent.ts.example.com"
       }
 spec:
   type: ExternalName
-  externalName: nas.internal.example.net
+  externalName: placeholder # operator-owned; overwritten
   ports:
-    - port: 5001
+    - port: 443
 ```
 
-The operator provisions the same Tailscale proxy StatefulSet it builds for
-Ingresses, but its serve config raw-TCP-forwards each declared port to
-`externalName` — `nas.ts.example.com:5001` tunnels bytes straight to
-`nas.internal.example.net:5001`. No HTTP handling, no TLS termination, no
-identity headers: whatever protocol the external host speaks passes through
-unchanged, which is exactly what makes this work for non-HTTP services.
+The operator provisions an egress proxy pod that joins the tailnet as its
+own node (`egress-qbittorrent`), with a userspace tailscaled exposing a
+loopback SOCKS5 listener and a socat forwarder dialing the `tailnet-fqdn`
+through it — hostname passthrough, so MagicDNS resolution and ACL
+enforcement happen inside the tailnet client. Each declared Service port is
+forwarded; the operator then points the Service's `externalName` at the
+proxy. In-cluster pods simply dial `qbittorrent.<namespace>.svc:443` and
+land on the tailnet host.
 
 Rules of the road:
 
-- Only `type: ExternalName` Services are considered; the annotation on any
-  other Service type is ignored.
-- Every `spec.ports` entry becomes a forward. Only TCP is supported
-  (tailscale serve does not forward UDP); an integer `targetPort` overrides
-  the backend port.
-- All annotation fields work as they do on Ingresses, including
-  `host-network` and `access` grants (grant destinations use a
-  `tag:hm-svc-<namespace>-<name>-<hash>` tag, so a Service and an Ingress
-  with the same name cannot collide).
-- A changed `externalName` or port list rewrites the proxy's serve config,
-  which the tailscale container picks up live — no proxy restart, no node
-  re-registration.
+- `tailnet-fqdn` is required, and `spec.externalName` becomes
+  operator-owned (its original value is a placeholder).
+- Only `type: ExternalName` Services are considered, and only TCP ports are
+  forwarded; an integer `targetPort` overrides the destination port on the
+  tailnet host.
+- The egress node authenticates like any proxy (via `user` or
+  `managed-key-tags`), but it is a tailnet _client_: give its tag access to
+  the destination in your ACL (e.g.
+  `tag:egress -> tag:svc-qbittorrent:443`). `access` grants and
+  `host-network` do not apply and are ignored with a warning event.
+- The forwarder image is configurable via the chart's `socatImage` value
+  (default `alpine/socat`).
 
 ## Contributing
 

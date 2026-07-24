@@ -9,6 +9,10 @@ proxyImage:
   repository: tailscale/tailscale
   tag: v1.98.8
 
+socatImage:
+  repository: alpine/socat
+  tag: 1.8.0.3
+
 image:
   repository: ghcr.io/potatonode/headmaster
   tag: ""  # defaults to .Chart.AppVersion

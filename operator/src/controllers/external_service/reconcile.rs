@@ -1,6 +1,9 @@
-//! Main reconcile loop for ExternalName `Service` objects. Provisions a
-//! Tailscale proxy for every ExternalName Service carrying the headmaster
-//! config annotation, and cleans up all proxy resources on deletion.
+//! Main reconcile loop for tailnet egress `Service` objects. For every
+//! ExternalName Service carrying the headmaster config annotation with a
+//! `tailnet-fqdn`, provisions an egress proxy — a pod that joins the tailnet
+//! as its own node and forwards each declared Service port to the tailnet
+//! destination — and points the Service's `externalName` at it, so in-cluster
+//! pods reach the tailnet host like any other Service.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +11,15 @@ use std::time::Duration;
 use futures::StreamExt;
 use headscale_client::Code;
 use headscale_client::headscale::v1::{DeleteNodeRequest, SetTagsRequest};
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_ext::{
+    ContainerExt, EnvVarExt, PodSpecExt, PodTemplateSpecExt, ServiceExt, ServicePortExt,
+    StatefulSetExt,
+};
+use k8s_openapi::api::apps::v1::StatefulSet;
+use k8s_openapi::api::core::v1::{
+    Container, ContainerPort, EnvVar, PodSecurityContext, PodSpec, PodTemplateSpec, SeccompProfile,
+    Secret, Service, ServicePort, ServiceSpec,
+};
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event as Finalizer, finalizer};
@@ -17,18 +28,25 @@ use kube::runtime::watcher;
 use kube::{Resource, ResourceExt};
 
 use crate::context::Context;
-use crate::controllers::applier::ChildApplier;
+use crate::controllers::applier::{ChildApplier, delete_ignoring_404};
 use crate::controllers::proxy::{
-    AuthKeyStatus, Error, ProxyNames, apply_proxy_rbac, apply_proxy_statefulset,
-    apply_serve_configmap, apply_wireguard_service, cleanup_proxy_resources,
+    AuthKeyStatus, Error, ProxyNames, apply_proxy_rbac, cleanup_proxy_resources,
     deregister_and_cleanup, ensure_auth_key, ensure_state_secret, headscale_connect,
-    namespace_is_deleting, read_secret_json, read_secret_string, service_auto_tag,
+    namespace_is_deleting, read_secret_json, read_secret_string,
 };
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
 use crate::types::{ANNOTATION_CONFIG, HeadscaleInstance, IngressAnnotations, ResourceStatus};
 
 const EXTERNAL_NAME_TYPE: &str = "ExternalName";
+const PROXY_COMPONENT: &str = "tailscale-proxy";
+/// tailscaled's userspace SOCKS5 listener, loopback-only inside the pod.
+const SOCKS5_PORT: u16 = 1055;
+/// socat listeners start here: unprivileged (no NET_BIND_SERVICE needed even
+/// when the Service declares a port like 443) and collision-free with the
+/// SOCKS5 port. The egress ClusterIP Service maps each declared port onto
+/// its listener.
+const LISTEN_PORT_BASE: i32 = 10000;
 
 pub fn stream(
     service_api: Api<Service>,
@@ -79,7 +97,7 @@ pub fn stream(
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             if let Err(e) = res {
-                tracing::warn!("ExternalName Service reconcile error: {e:?}");
+                tracing::warn!("egress Service reconcile error: {e:?}");
             }
         })
 }
@@ -89,7 +107,7 @@ pub fn stream(
 fn error_policy(obj: Arc<Service>, e: &Error, _ctx: Arc<Context>) -> Action {
     tracing::warn!(
         name = obj.name_any(),
-        "ExternalName Service reconcile failed: {e:?}"
+        "egress Service reconcile failed: {e:?}"
     );
     Action::requeue(Duration::from_secs(30))
 }
@@ -172,7 +190,9 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
     let names = ProxyNames::for_service(&svc_ns, &svc_name);
 
     // Shape release: the annotation was removed, or the Service is no longer
-    // ExternalName (e.g. converted to ClusterIP). Deregister and relinquish.
+    // ExternalName. Deregister and relinquish. spec.externalName is left
+    // as-is; it may still point at the (now deleted) egress Service until the
+    // user updates it.
     if !is_external_name(&svc) || !svc.annotations().contains_key(ANNOTATION_CONFIG) {
         if let Some(headscale_ref) = IngressAnnotations::headscale_ref(&*svc) {
             deregister_and_cleanup(ctx, op_ns, &names, &svc.object_ref(&()), &headscale_ref)
@@ -203,11 +223,63 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
 
     let annotations = IngressAnnotations::parse(&*svc)?;
 
+    let Some(tailnet_fqdn) = annotations.tailnet_fqdn.clone().filter(|f| !f.is_empty()) else {
+        let _ = ctx
+            .recorder()
+            .publish_warning(
+                &svc.object_ref(&()),
+                "InvalidConfig",
+                "egress Service needs 'tailnet-fqdn' in the config annotation: \
+                 the tailnet destination to forward to",
+            )
+            .await;
+        return Ok(Action::await_change());
+    };
+
+    // Egress proxies are tailnet *clients*: access grants describe who may
+    // reach a destination, and host networking serves inbound reachability —
+    // neither applies here. Warn so a copy-pasted config isn't silently
+    // misleading, then continue.
+    if !annotations.access.is_empty() {
+        let _ = ctx
+            .recorder()
+            .publish_warning(
+                &svc.object_ref(&()),
+                "IgnoredConfig",
+                "'access' does not apply to egress proxies; grant this proxy's \
+                 tag access to the destination in the tailnet ACL instead",
+            )
+            .await;
+    }
+    if annotations.host_network {
+        let _ = ctx
+            .recorder()
+            .publish_warning(
+                &svc.object_ref(&()),
+                "IgnoredConfig",
+                "'host-network' does not apply to egress proxies; ignored",
+            )
+            .await;
+    }
+
+    let forwards = collect_tcp_forwards(&svc);
+    if forwards.is_empty() {
+        let _ = ctx
+            .recorder()
+            .publish_warning(
+                &svc.object_ref(&()),
+                "InvalidConfig",
+                "egress Service declares no TCP ports; add spec.ports to forward them",
+            )
+            .await;
+        return Ok(Action::await_change());
+    }
+
     if namespace_is_deleting(&ctx.client, &svc_ns).await? {
         tracing::info!(
             name = svc_name,
             namespace = svc_ns,
-            "ExternalName Service: namespace is deleting; skipping"
+            "egress Service: namespace is deleting; skipping"
         );
         return Ok(Action::await_change());
     }
@@ -273,37 +345,6 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
 
-    let Some(external_name) = svc
-        .spec
-        .as_ref()
-        .and_then(|s| s.external_name.clone())
-        .filter(|n| !n.is_empty())
-    else {
-        let _ = ctx
-            .recorder()
-            .publish_warning(
-                &svc.object_ref(&()),
-                "InvalidConfig",
-                "ExternalName Service has no spec.externalName",
-            )
-            .await;
-        return Ok(Action::await_change());
-    };
-
-    let forwards = collect_tcp_forwards(&svc);
-    if forwards.is_empty() {
-        let _ = ctx
-            .recorder()
-            .publish_warning(
-                &svc.object_ref(&()),
-                "InvalidConfig",
-                "ExternalName Service declares no TCP ports; add spec.ports to expose it",
-            )
-            .await;
-        return Ok(Action::await_change());
-    }
-
-    let dns_base_domain = instance.spec.dns_base_domain.clone();
     let login_url = if instance.spec.external.is_some() {
         instance.spec.server_url.clone()
     } else {
@@ -312,7 +353,6 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
             annotations.headscale_ref,
         )
     };
-    let tailnet_fqdn = format!("{}.{dns_base_domain}", annotations.hostname);
 
     let child = ChildApplier::for_proxy(
         ctx,
@@ -324,29 +364,7 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         &svc_ns,
     );
 
-    for grant in &annotations.access {
-        if grant.from.is_empty() {
-            let _ = ctx
-                .recorder()
-                .publish_warning(
-                    &svc.object_ref(&()),
-                    "InvalidConfig",
-                    "access grant 'from' must not be empty",
-                )
-                .await;
-            return Ok(Action::await_change());
-        }
-    }
-
-    let auto_tag = if !annotations.access.is_empty() {
-        Some(service_auto_tag(&svc_ns, &svc_name))
-    } else {
-        None
-    };
-
     let mut headscale = headscale_connect(ctx, op_ns, &annotations.headscale_ref).await?;
-
-    let networking = apply_wireguard_service(&child, &names, annotations.host_network).await?;
 
     // If headscale_ref changed, deregister from old HI and reset secrets before ensure_auth_key.
     let retarget = match Api::<Secret>::namespaced(ctx.client.clone(), op_ns)
@@ -381,12 +399,12 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
                 Err(e) => return Err(Error::Kube(e)),
             }
         }
-        crate::controllers::applier::delete_ignoring_404(
+        delete_ignoring_404(
             Api::<Secret>::namespaced(ctx.client.clone(), op_ns),
             &names.config_secret_name,
         )
         .await?;
-        crate::controllers::applier::delete_ignoring_404(
+        delete_ignoring_404(
             Api::<Secret>::namespaced(ctx.client.clone(), op_ns),
             &names.state_secret_name,
         )
@@ -402,7 +420,7 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         &names,
         annotations.user.as_deref(),
         &annotations.managed_key_tags,
-        auto_tag.as_deref(),
+        None,
         annotations.auth_key_expiry_secs,
         annotations.auth_key_reusable,
     )
@@ -413,20 +431,72 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
 
     let state_secret = ensure_state_secret(&child, &names, &annotations.headscale_ref).await?;
 
-    let serve_json = build_tcp_serve_json(&external_name, &forwards);
-    apply_serve_configmap(&child, &names, &serve_json).await?;
+    // The egress ClusterIP Service: declared port → socat listener port.
+    // apply_service stamps the selector, targeting only this proxy's pods.
+    child
+        .apply_service(
+            PROXY_COMPONENT,
+            Service::new(&names.wg_service_name).spec(ServiceSpec {
+                ports: Some(
+                    forwards
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (port, _))| {
+                            ServicePort::tcp(format!("fwd-{port}"), *port)
+                                .target_port(LISTEN_PORT_BASE + idx as i32)
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+        )
+        .await?;
 
     apply_proxy_rbac(&child, &names).await?;
 
-    apply_proxy_statefulset(
-        &child,
-        &names,
-        &ctx.proxy_image,
-        &login_url,
-        &annotations.hostname,
-        &networking,
-    )
-    .await?;
+    child
+        .apply_statefulset(
+            PROXY_COMPONENT,
+            build_egress_statefulset(
+                &names,
+                &ctx.proxy_image,
+                &ctx.socat_image,
+                &login_url,
+                &annotations.hostname,
+                &tailnet_fqdn,
+                &forwards,
+            ),
+        )
+        .await?;
+
+    // Point the annotated Service at the egress proxy and record ownership.
+    // spec.externalName is operator-owned on adopted Services; the user's
+    // original value is a placeholder.
+    Api::<Service>::namespaced(ctx.client.clone(), &svc_ns)
+        .patch(
+            &svc_name,
+            &PatchParams::apply(&crate::field_manager(op_ns)).force(),
+            &Patch::Apply(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": svc_name,
+                    "namespace": svc_ns,
+                    "annotations": {
+                        crate::ANNOTATION_CLAIMED_BY: op_ns,
+                    }
+                },
+                "spec": {
+                    "type": EXTERNAL_NAME_TYPE,
+                    "externalName": format!(
+                        "{}.{op_ns}.svc.cluster.local",
+                        names.wg_service_name
+                    ),
+                }
+            })),
+        )
+        .await
+        .map_err(Error::Kube)?;
 
     let device_id = read_secret_string(&state_secret, "device_id");
     let device_ips =
@@ -439,7 +509,6 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         .managed_key_tags
         .iter()
         .cloned()
-        .chain(auto_tag.iter().cloned())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -465,9 +534,8 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         if device_ips.is_empty() {
             tracing::info!(
                 name = svc_name,
-                hostname = annotations.hostname,
-                fqdn = tailnet_fqdn,
-                "ExternalName Service: proxy registered but waiting for IP assignment"
+                tailnet_fqdn,
+                "egress Service: proxy registered but waiting for IP assignment"
             );
         } else {
             let _ = ctx.recorder().publish_ready(&svc.object_ref(&())).await;
@@ -475,8 +543,8 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
     } else {
         tracing::info!(
             name = svc_name,
-            hostname = annotations.hostname,
-            "ExternalName Service: waiting for proxy to register"
+            tailnet_fqdn,
+            "egress Service: waiting for proxy to register"
         );
         let _ = ctx
             .recorder()
@@ -484,7 +552,7 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
                 &svc.object_ref(&()),
                 "ProxyNotRegistered",
                 &format!(
-                    "proxy for Service '{svc_name}' has not registered with headscale; \
+                    "egress proxy for Service '{svc_name}' has not registered with headscale; \
                      if this persists beyond the auth-key expiry window, delete the \
                      Secret '{}' to force key rotation",
                     names.config_secret_name
@@ -493,38 +561,17 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
             .await;
     }
 
-    // Record ownership so observers can discover which operator deployment
-    // manages this Service without inspecting finalizers.
-    Api::<Service>::namespaced(ctx.client.clone(), &svc_ns)
-        .patch(
-            &svc_name,
-            &PatchParams::apply(&crate::field_manager(op_ns)).force(),
-            &Patch::Apply(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Service",
-                "metadata": {
-                    "name": svc_name,
-                    "namespace": svc_ns,
-                    "annotations": {
-                        crate::ANNOTATION_CLAIMED_BY: op_ns,
-                    }
-                }
-            })),
-        )
-        .await
-        .map_err(Error::Kube)?;
-
     if set_tags_failed {
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
     Ok(Action::await_change())
 }
 
-/// Collects `(tailnet_port, backend_port)` pairs from the Service's declared
-/// ports. Only TCP ports are usable — tailscale serve's TCPForward is TCP-only
-/// — so UDP/SCTP entries are skipped with a warning. An integer `targetPort`
-/// overrides the backend port; named target ports are meaningless for an
-/// external host and fall back to `port`.
+/// Collects `(service_port, backend_port)` pairs from the Service's declared
+/// ports. Only TCP is forwardable; UDP/SCTP entries are skipped with a
+/// warning. An integer `targetPort` overrides the destination port on the
+/// tailnet host; named target ports are meaningless there and fall back to
+/// `port`.
 fn collect_tcp_forwards(svc: &Service) -> Vec<(i32, i32)> {
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     svc.spec
@@ -539,8 +586,7 @@ fn collect_tcp_forwards(svc: &Service) -> Vec<(i32, i32)> {
                     service = svc.name_any(),
                     port = p.port,
                     protocol = p.protocol.as_deref().unwrap_or_default(),
-                    "ExternalName Service: non-TCP port skipped; \
-                     tailscale serve only forwards TCP"
+                    "egress Service: non-TCP port skipped; only TCP is forwarded"
                 );
             }
             tcp
@@ -555,20 +601,98 @@ fn collect_tcp_forwards(svc: &Service) -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Builds the tailscale serve config: one raw TCP forward per declared port,
-/// straight to the external hostname. No TLS termination, no HTTP handling —
-/// bytes in, bytes out.
-fn build_tcp_serve_json(external_name: &str, forwards: &[(i32, i32)]) -> serde_json::Value {
-    let tcp: serde_json::Map<String, serde_json::Value> = forwards
+fn build_egress_statefulset(
+    names: &ProxyNames,
+    proxy_image: &str,
+    socat_image: &str,
+    headscale_url: &str,
+    hostname: &str,
+    tailnet_fqdn: &str,
+    forwards: &[(i32, i32)],
+) -> StatefulSet {
+    let tailscale = Container::new("tailscale")
+        .image(proxy_image)
+        .allow_privilege_escalation(false)
+        .drop_capabilities(["ALL"])
+        .env([
+            EnvVar::secret_key_ref("TS_AUTHKEY", &names.config_secret_name, "key"),
+            EnvVar::value("TS_HOSTNAME", hostname),
+            // TS_EXTRA_ARGS → passed to `tailscale up` (CLI flags only).
+            EnvVar::value(
+                "TS_EXTRA_ARGS",
+                format!(
+                    "--login-server={headscale_url} \
+                     --advertise-exit-node=false \
+                     --snat-subnet-routes=false \
+                     --stateful-filtering=false"
+                ),
+            ),
+            // Outbound-only client: no pinned WireGuard port, no serve
+            // config. --socket places the IPC socket in /tmp which is
+            // writable in restricted containers.
+            EnvVar::value("TS_TAILSCALED_EXTRA_ARGS", "--socket=/tmp/tailscaled.sock"),
+            EnvVar::value("TS_USERSPACE", "true"),
+            // Loopback SOCKS5: the forwarder shares the pod network
+            // namespace and dials the tailnet through it; nothing outside
+            // the pod can reach it.
+            EnvVar::value("TS_SOCKS5_SERVER", format!("localhost:{SOCKS5_PORT}")),
+            EnvVar::value("TS_KUBE_SECRET", &names.state_secret_name),
+            EnvVar::metadata_name("POD_NAME"),
+            EnvVar::metadata_namespace("POD_NAMESPACE"),
+        ]);
+    let forwarder = Container::new("forwarder")
+        .image(socat_image)
+        .allow_privilege_escalation(false)
+        .drop_capabilities(["ALL"])
+        .command(["/bin/sh", "-c", &forwarder_script(tailnet_fqdn, forwards)])
+        .ports(
+            forwards
+                .iter()
+                .enumerate()
+                .map(|(idx, (port, _))| ContainerPort {
+                    name: Some(format!("fwd-{port}")),
+                    container_port: LISTEN_PORT_BASE + idx as i32,
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }),
+        );
+    let mut base = PodSpec::container(tailscale).service_account_name(&names.proxy_name);
+    base.containers.push(forwarder);
+    let pod_spec = PodSpec {
+        security_context: Some(PodSecurityContext {
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".into(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        }),
+        ..base
+    };
+    StatefulSet::new(&names.proxy_name)
+        .replicas(1)
+        .service_name(&names.wg_service_name)
+        .template(PodTemplateSpec::new().pod_spec(pod_spec))
+}
+
+/// One socat per forward, all backgrounded, `wait` keeping the container
+/// alive. SOCKS5-CONNECT passes the tailnet FQDN through to tailscaled's
+/// SOCKS5 server unresolved, so MagicDNS resolution and ACL enforcement
+/// happen inside the tailnet client — the pod needs no route or DNS for the
+/// tailnet at all.
+fn forwarder_script(tailnet_fqdn: &str, forwards: &[(i32, i32)]) -> String {
+    let mut lines: Vec<String> = forwards
         .iter()
-        .map(|(listen, backend)| {
-            (
-                listen.to_string(),
-                serde_json::json!({ "TCPForward": format!("{external_name}:{backend}") }),
+        .enumerate()
+        .map(|(idx, (_, backend))| {
+            format!(
+                "socat TCP-LISTEN:{listen},fork,reuseaddr \
+                 SOCKS5-CONNECT:127.0.0.1:{SOCKS5_PORT}:{tailnet_fqdn}:{backend} &",
+                listen = LISTEN_PORT_BASE + idx as i32,
             )
         })
         .collect();
-    serde_json::json!({ "TCP": tcp })
+    lines.push("wait".to_string());
+    lines.join("\n")
 }
 
 // ── cleanup ───────────────────────────────────────────────────────────────────
@@ -591,7 +715,7 @@ async fn cleanup(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
 
 /// Removes our finalizer from the Service and clears the `claimed-by`
 /// annotation. Same optimistic-lock dance as the Ingress controller's
-/// `release_ingress`; Services carry no operator-written status to clear.
+/// `release_ingress`.
 async fn release_service(ctx: &Context, svc_ns: &str, svc_name: &str) -> Result<(), Error> {
     let api = Api::<Service>::namespaced(ctx.client.clone(), svc_ns);
     let live = api.get(svc_name).await.map_err(Error::Kube)?;
@@ -626,16 +750,16 @@ mod tests {
     use super::*;
     use crate::controllers::ingress::test_support::test_ctx;
     use crate::test_support::{FaultService, all_500};
-    use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+    use k8s_openapi::api::core::v1::ServicePort as CoreServicePort;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     use std::collections::BTreeMap;
 
-    fn external_name_service(annotation: Option<&str>) -> Service {
+    fn egress_service(annotation: Option<&str>) -> Service {
         Service {
             metadata: ObjectMeta {
-                name: Some("ext-db".to_string()),
-                namespace: Some("apps".to_string()),
+                name: Some("qbittorrent".to_string()),
+                namespace: Some("media".to_string()),
                 uid: Some("00000000-0000-0000-0000-000000000002".to_string()),
                 annotations: annotation
                     .map(|a| BTreeMap::from([(ANNOTATION_CONFIG.to_string(), a.to_string())])),
@@ -643,9 +767,9 @@ mod tests {
             },
             spec: Some(ServiceSpec {
                 type_: Some("ExternalName".to_string()),
-                external_name: Some("db.example.net".to_string()),
-                ports: Some(vec![ServicePort {
-                    port: 5432,
+                external_name: Some("placeholder".to_string()),
+                ports: Some(vec![CoreServicePort {
+                    port: 443,
                     ..Default::default()
                 }]),
                 ..Default::default()
@@ -654,29 +778,77 @@ mod tests {
         }
     }
 
-    // ── serve config tests ────────────────────────────────────────────────────
+    // ── forwarder tests ───────────────────────────────────────────────────────
 
     #[test]
-    fn tcp_serve_json_forwards_each_port() {
-        let json = build_tcp_serve_json("db.example.net", &[(5432, 5432), (6432, 16432)]);
-        assert_eq!(json["TCP"]["5432"]["TCPForward"], "db.example.net:5432");
-        assert_eq!(json["TCP"]["6432"]["TCPForward"], "db.example.net:16432");
+    fn forwarder_script_one_socat_per_port_via_socks5() {
+        let script = forwarder_script("qbittorrent.ts.example.com", &[(443, 443), (8080, 9090)]);
+        assert_eq!(
+            script,
+            "socat TCP-LISTEN:10000,fork,reuseaddr \
+             SOCKS5-CONNECT:127.0.0.1:1055:qbittorrent.ts.example.com:443 &\n\
+             socat TCP-LISTEN:10001,fork,reuseaddr \
+             SOCKS5-CONNECT:127.0.0.1:1055:qbittorrent.ts.example.com:9090 &\n\
+             wait"
+        );
+    }
+
+    #[test]
+    fn egress_statefulset_has_socks5_and_no_serve_config() {
+        let names = ProxyNames::for_service("media", "qbittorrent");
+        let sts = build_egress_statefulset(
+            &names,
+            "tailscale/tailscale:stable",
+            "alpine/socat:1.8.0.3",
+            "https://headscale.example.com",
+            "egress-qbittorrent",
+            "qbittorrent.ts.example.com",
+            &[(443, 443)],
+        );
+        let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+        let ts = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "tailscale")
+            .unwrap();
+        let env_names: Vec<_> = ts
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(env_names.contains(&"TS_SOCKS5_SERVER"));
         assert!(
-            json.get("Web").is_none(),
-            "raw TCP forwards must not carry a Web section"
+            !env_names.contains(&"TS_SERVE_CONFIG"),
+            "egress proxies serve nothing inbound"
+        );
+        assert!(
+            !env_names.contains(&"TS_DEBUG_PRETENDPOINT"),
+            "egress proxies advertise no endpoint"
+        );
+        let fwd = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "forwarder")
+            .unwrap();
+        assert_eq!(
+            fwd.ports.as_ref().unwrap()[0].container_port,
+            10000,
+            "listeners start at the unprivileged base port"
         );
     }
 
     #[test]
     fn collect_forwards_defaults_backend_to_port() {
-        let svc = external_name_service(None);
-        assert_eq!(collect_tcp_forwards(&svc), vec![(5432, 5432)]);
+        let svc = egress_service(None);
+        assert_eq!(collect_tcp_forwards(&svc), vec![(443, 443)]);
     }
 
     #[test]
     fn collect_forwards_honors_integer_target_port() {
-        let mut svc = external_name_service(None);
-        svc.spec.as_mut().unwrap().ports = Some(vec![ServicePort {
+        let mut svc = egress_service(None);
+        svc.spec.as_mut().unwrap().ports = Some(vec![CoreServicePort {
             port: 443,
             target_port: Some(IntOrString::Int(8443)),
             ..Default::default()
@@ -686,8 +858,8 @@ mod tests {
 
     #[test]
     fn collect_forwards_ignores_named_target_port() {
-        let mut svc = external_name_service(None);
-        svc.spec.as_mut().unwrap().ports = Some(vec![ServicePort {
+        let mut svc = egress_service(None);
+        svc.spec.as_mut().unwrap().ports = Some(vec![CoreServicePort {
             port: 443,
             target_port: Some(IntOrString::String("https".to_string())),
             ..Default::default()
@@ -695,20 +867,20 @@ mod tests {
         assert_eq!(
             collect_tcp_forwards(&svc),
             vec![(443, 443)],
-            "named targetPort is meaningless for an external host; use port"
+            "named targetPort is meaningless for a tailnet host; use port"
         );
     }
 
     #[test]
     fn collect_forwards_skips_udp_ports() {
-        let mut svc = external_name_service(None);
+        let mut svc = egress_service(None);
         svc.spec.as_mut().unwrap().ports = Some(vec![
-            ServicePort {
+            CoreServicePort {
                 port: 53,
                 protocol: Some("UDP".to_string()),
                 ..Default::default()
             },
-            ServicePort {
+            CoreServicePort {
                 port: 853,
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
@@ -721,10 +893,8 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_skips_service_without_annotation() {
-        // ExternalName Service, no annotation, no finalizer → silently skipped
-        // (all_500 client proves no K8s call is made).
         let ctx = Arc::new(test_ctx(FaultService::client(all_500)));
-        let svc = Arc::new(external_name_service(None));
+        let svc = Arc::new(egress_service(None));
         let result = reconcile(svc, ctx).await;
         assert!(
             result.is_ok(),
@@ -735,7 +905,9 @@ mod tests {
     #[tokio::test]
     async fn reconcile_skips_non_external_name_service() {
         let ctx = Arc::new(test_ctx(FaultService::client(all_500)));
-        let mut svc = external_name_service(Some(r#"{"headscale-ref":"main","user":"alice"}"#));
+        let mut svc = egress_service(Some(
+            r#"{"headscale-ref":"main","user":"alice","tailnet-fqdn":"x.ts.example.com"}"#,
+        ));
         svc.spec.as_mut().unwrap().type_ = Some("ClusterIP".to_string());
         let result = reconcile(Arc::new(svc), ctx).await;
         assert!(
@@ -747,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_skips_service_targeted_at_other_deployment() {
         let ctx = Arc::new(test_ctx(FaultService::client(all_500)));
-        let svc = Arc::new(external_name_service(Some(
+        let svc = Arc::new(egress_service(Some(
             r#"{"headscale-ref":"main","user":"alice","headscale-namespace":"other-ns"}"#,
         )));
         let result = reconcile(svc, ctx).await;
@@ -759,17 +931,14 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_processes_service_when_claim_default_true() {
-        // Valid annotation + claim_default → Layer 2 proceeds to the
-        // HeadscaleInstance lookup, which the all_500 mock fails — proving
-        // adoption was attempted.
         let ctx = Arc::new(test_ctx(FaultService::client(all_500)));
-        let svc = Arc::new(external_name_service(Some(
-            r#"{"headscale-ref":"main","user":"alice"}"#,
+        let svc = Arc::new(egress_service(Some(
+            r#"{"headscale-ref":"main","user":"alice","tailnet-fqdn":"x.ts.example.com"}"#,
         )));
         let result = reconcile(svc, ctx).await;
         assert!(
             result.is_err(),
-            "default deployment must process annotated ExternalName Services (K8s call expected)"
+            "default deployment must process annotated egress Services (K8s call expected)"
         );
     }
 }

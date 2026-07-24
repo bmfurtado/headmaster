@@ -200,6 +200,21 @@
       },
       "type": "object"
     },
+    "socatImage": {
+      "additionalProperties": false,
+      "description": "Container image providing socat, used as the forwarder in tailnet egress proxy pods.",
+      "properties": {
+        "repository": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tag": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "image": {
       "additionalProperties": false,
       "description": "Container image for the headmaster operator.",

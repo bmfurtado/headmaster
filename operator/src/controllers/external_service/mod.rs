@@ -1,13 +1,13 @@
-//! ExternalName Service controller — provisions a Tailscale proxy for every
-//! `Service` of `type: ExternalName` carrying the headmaster config
-//! annotation. The proxy TCP-forwards each declared Service port to the
-//! external hostname via tailscale serve, so the external endpoint appears
-//! on the tailnet as its own node — no socat, no extra binary.
+//! Tailnet egress controller — makes tailnet hosts reachable from in-cluster
+//! pods. For every `Service` of `type: ExternalName` carrying the headmaster
+//! config annotation with a `tailnet-fqdn`, provisions an egress proxy pod
+//! that joins the tailnet as its own node (userspace tailscaled with a
+//! loopback SOCKS5 listener) and socat-forwards each declared Service port to
+//! the tailnet destination; the Service's `externalName` is then pointed at
+//! the proxy, so pods dial the Service and land on the tailnet host.
 //!
-//! Shares the proxy building blocks (names, auth keys, child resources,
-//! cleanup) with the Ingress controller via [`crate::controllers::proxy`];
-//! this module owns what is Service-specific: adoption gates, TCP forward
-//! collection, and ownership release.
+//! Shares the proxy building blocks (names, auth keys, cleanup, headscale
+//! connection) with the Ingress controller via [`crate::controllers::proxy`].
 
 mod reconcile;
 

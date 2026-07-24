@@ -305,6 +305,21 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
 
     let annotations = IngressAnnotations::parse(&*ingress)?;
 
+    // tailnet-fqdn is the egress Service knob; on an Ingress it can only be
+    // a copy-paste mistake, and silently ignoring it would mislead.
+    if annotations.tailnet_fqdn.is_some() {
+        let _ = ctx
+            .recorder()
+            .publish_warning(
+                &ingress.object_ref(&()),
+                "InvalidConfig",
+                "'tailnet-fqdn' does not apply to Ingresses; it selects the tailnet \
+                 destination of an egress ExternalName Service",
+            )
+            .await;
+        return Ok(Action::await_change());
+    }
+
     if namespace_is_deleting(&ctx.client, &ingress_ns).await? {
         tracing::info!(
             name = ingress_name,

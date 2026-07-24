@@ -284,6 +284,7 @@ pub fn make_ctx(
         },
         headscale_image: "ghcr.io/juanfont/headscale:v0.29.0-beta.2".to_string(),
         proxy_image: "tailscale/tailscale:v1.98.4".to_string(),
+        socat_image: "alpine/socat:1.8.0.3".to_string(),
         operator_image: "ghcr.io/potatonode/headmaster:dev".to_string(),
         claim_default: true,
     })

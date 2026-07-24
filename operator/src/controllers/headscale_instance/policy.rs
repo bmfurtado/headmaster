@@ -7,14 +7,15 @@ use std::collections::HashSet;
 use headscale_client::headscale::v1::{GetPolicyRequest, SetPolicyRequest};
 use headscale_client::policy::{PolicyEditor, policies_are_semantically_equal};
 use jsonc_parser::cst::CstInputValue;
-use k8s_openapi::api::core::v1::{ObjectReference, Secret, Service};
+use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::Api;
 use kube::{Resource, ResourceExt};
 
 use super::Error;
 use crate::context::Context;
-use crate::controllers::proxy::{headscale_connect, ingress_auto_tag, service_auto_tag};
+use crate::controllers::ingress::ingress_auto_tag;
+use crate::controllers::proxy::headscale_connect;
 use crate::controllers::recorder::RecorderExt;
 use crate::types::HeadscaleInstancePolicy;
 use crate::types::IngressAnnotations;
@@ -27,11 +28,10 @@ use crate::types::IngressAnnotations;
 /// value written to headscale so that a spec change (which triggers a reconcile)
 /// cannot clobber SCIM-managed group membership.
 ///
-/// `ingresses` and `services` list the Ingresses and ExternalName Services
-/// that reference this HeadscaleInstance. Those with non-empty `access`
-/// contribute operator-managed `grants` entries. Grants whose `from`
-/// references a group not yet in the live policy are skipped and a
-/// `WaitingForGroup` warning event is posted on the parent object.
+/// `ingresses` lists all Ingresses that reference this HeadscaleInstance. Those
+/// with non-empty `access` contribute operator-managed `grants` entries. Grants
+/// whose `from` references a group not yet in the live policy are skipped and a
+/// `WaitingForGroup` warning event is posted on the Ingress.
 ///
 /// When `policy` is `None`, the operator sets headscale to allow-all by calling
 /// `SetPolicy("")`. This is idempotent: the call is skipped when the live policy
@@ -43,7 +43,6 @@ pub(super) async fn sync_policy(
     policy: Option<&HeadscaleInstancePolicy>,
     scim_enabled: bool,
     ingresses: &[Ingress],
-    services: &[Service],
 ) -> Result<(), Error> {
     let mut client = headscale_connect(ctx, namespace, instance)
         .await
@@ -95,8 +94,7 @@ pub(super) async fn sync_policy(
     // Merge operator-managed grants from contributing Ingresses. This is async
     // (publishes WaitingForGroup warnings) but returns a plain String; CST work
     // inside it happens after all .awaits.
-    let effective_desired =
-        merge_proxy_grants(ctx, &policy_before_grants, ingresses, services).await;
+    let effective_desired = merge_ingress_grants(ctx, &policy_before_grants, ingresses).await;
 
     // Compare semantically: headscale normalises whitespace and strips comments
     // when it stores the policy, so a textual diff may not mean the policy
@@ -127,54 +125,33 @@ pub(super) async fn sync_policy(
 
 const HEADMASTER_TAG: &str = "tag:headmaster";
 
-/// Collects operator-owned `grants` from contributing Ingresses and
-/// ExternalName Services, publishes `WaitingForGroup` warnings for unresolved
-/// groups, then appends the grants to `policy_str` and returns the updated
-/// policy. CST mutations happen only after all async calls so that no
-/// `PolicyEditor` ever crosses an `.await`.
-async fn merge_proxy_grants(
-    ctx: &Context,
-    policy_str: &str,
-    ingresses: &[Ingress],
-    services: &[Service],
-) -> String {
+/// Collects operator-owned `grants` from contributing Ingresses, publishes
+/// `WaitingForGroup` warnings for unresolved groups, then appends the grants
+/// to `policy_str` and returns the updated policy. CST mutations happen only
+/// after all async calls so that no `PolicyEditor` ever crosses an `.await`.
+async fn merge_ingress_grants(ctx: &Context, policy_str: &str, ingresses: &[Ingress]) -> String {
     // Extract known groups synchronously before any await.
     let known_groups: HashSet<String> = PolicyEditor::parse(policy_str)
         .map(|e| e.known_groups())
         .unwrap_or_default();
     // PolicyEditor dropped immediately after known_groups is computed.
 
-    // One flat list of grant sources: (event target, annotations, auto tag),
-    // ingresses first then services, each sorted by (namespace, name) so the
-    // rendered policy is deterministic.
-    let mut sources: Vec<(ObjectReference, IngressAnnotations, String)> = Vec::new();
     let mut sorted_ingresses: Vec<&Ingress> = ingresses.iter().collect();
     sorted_ingresses.sort_by_key(|ing| (ing.namespace().unwrap_or_default(), ing.name_any()));
-    for ing in sorted_ingresses {
-        if let Ok(a) = IngressAnnotations::parse(ing)
-            && !a.access.is_empty()
-        {
-            let tag = ingress_auto_tag(&ing.namespace().unwrap_or_default(), &ing.name_any());
-            sources.push((ing.object_ref(&()), a, tag));
-        }
-    }
-    let mut sorted_services: Vec<&Service> = services.iter().collect();
-    sorted_services.sort_by_key(|svc| (svc.namespace().unwrap_or_default(), svc.name_any()));
-    for svc in sorted_services {
-        if let Ok(a) = IngressAnnotations::parse(svc)
-            && !a.access.is_empty()
-        {
-            let tag = service_auto_tag(&svc.namespace().unwrap_or_default(), &svc.name_any());
-            sources.push((svc.object_ref(&()), a, tag));
-        }
-    }
 
     // Accumulate (grant, auto_tag) pairs. CstInputValue is Send so these are
     // safe to hold across the async publish_warning calls below.
     let mut ingress_grants: Vec<(CstInputValue, String)> = Vec::new();
 
-    for (obj_ref, annotations, auto_tag) in &sources {
-        let auto_tag = auto_tag.clone();
+    for ing in sorted_ingresses {
+        let annotations = match IngressAnnotations::parse(ing) {
+            Ok(a) if !a.access.is_empty() => a,
+            _ => continue,
+        };
+
+        let ing_ns = ing.namespace().unwrap_or_default();
+        let ing_name = ing.name_any();
+        let auto_tag = ingress_auto_tag(&ing_ns, &ing_name);
 
         for grant in &annotations.access {
             let missing_groups: Vec<&str> = grant
@@ -189,7 +166,7 @@ async fn merge_proxy_grants(
                 if let Err(e) = ctx
                     .recorder()
                     .publish_warning(
-                        obj_ref,
+                        &ing.object_ref(&()),
                         "WaitingForGroup",
                         &format!(
                             "access grant references groups not yet synced: {}; \
@@ -200,7 +177,7 @@ async fn merge_proxy_grants(
                     .await
                 {
                     tracing::warn!(
-                        parent = obj_ref.name.as_deref().unwrap_or_default(),
+                        ingress = %ing.name_any(),
                         error = ?e,
                         "failed to publish WaitingForGroup event"
                     );
@@ -527,7 +504,6 @@ mod tests {
             hujson_policy.as_ref(),
             false,
             &[],
-            &[],
         )
         .await
         .expect("sync_policy must succeed");
@@ -561,7 +537,6 @@ mod tests {
             "test-instance",
             new_policy.as_ref(),
             false,
-            &[],
             &[],
         )
         .await
@@ -606,7 +581,6 @@ mod tests {
             new_policy.as_ref(),
             true,
             &[],
-            &[],
         )
         .await
         .expect("sync_policy must succeed");
@@ -638,17 +612,9 @@ mod tests {
 
         let policy = inline_policy(r#"{"acls":[{"action":"accept"}]}"#);
 
-        sync_policy(
-            &ctx,
-            "default",
-            "test-instance",
-            policy.as_ref(),
-            true,
-            &[],
-            &[],
-        )
-        .await
-        .expect("sync_policy must succeed");
+        sync_policy(&ctx, "default", "test-instance", policy.as_ref(), true, &[])
+            .await
+            .expect("sync_policy must succeed");
 
         assert_eq!(
             *policy_store.lock().unwrap(),
@@ -681,7 +647,6 @@ mod tests {
             new_policy.as_ref(),
             false,
             &[],
-            &[],
         )
         .await
         .expect("sync_policy must succeed");
@@ -707,7 +672,7 @@ mod tests {
             ..test_ctx(FaultService::client(api_key_secret))
         };
 
-        sync_policy(&ctx, "default", "test-instance", None, false, &[], &[])
+        sync_policy(&ctx, "default", "test-instance", None, false, &[])
             .await
             .expect("sync_policy must succeed with None policy");
 
@@ -729,7 +694,7 @@ mod tests {
             ..test_ctx(FaultService::client(api_key_secret))
         };
 
-        sync_policy(&ctx, "default", "test-instance", None, false, &[], &[])
+        sync_policy(&ctx, "default", "test-instance", None, false, &[])
             .await
             .expect("sync_policy must not call SetPolicy when current policy is already empty");
     }
@@ -795,7 +760,6 @@ mod tests {
             inline_policy(r#"{"acls":[],"groups":{"group:eng":["alice@example.com"]}}"#).as_ref(),
             false,
             &[ingress],
-            &[],
         )
         .await
         .expect("sync_policy must succeed");
@@ -845,7 +809,6 @@ mod tests {
             inline_policy(r#"{"acls":[]}"#).as_ref(),
             false,
             &[ingress],
-            &[],
         )
         .await
         .expect("sync_policy must succeed even when group is absent");
@@ -886,7 +849,6 @@ mod tests {
             inline_policy(r#"{"acls":[],"groups":{"group:eng":["alice@example.com"]}}"#).as_ref(),
             false,
             &[ingress],
-            &[],
         )
         .await
         .expect("sync_policy must succeed");
@@ -921,7 +883,6 @@ mod tests {
             "test-instance",
             inline_policy(r#"{"acls":[]}"#).as_ref(),
             false,
-            &[],
             &[],
         )
         .await

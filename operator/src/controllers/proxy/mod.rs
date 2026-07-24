@@ -12,8 +12,8 @@ mod resources;
 mod support;
 
 pub use names::{
-    ingress_auto_tag, proxy_state_secret_name, proxy_sts_name, service_auto_tag,
-    service_proxy_state_secret_name, service_proxy_sts_name,
+    ingress_auto_tag, proxy_state_secret_name, proxy_sts_name, service_proxy_state_secret_name,
+    service_proxy_sts_name,
 };
 
 pub(crate) use auth_key::{AuthKeyStatus, ensure_auth_key};

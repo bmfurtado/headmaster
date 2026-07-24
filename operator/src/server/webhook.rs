@@ -450,6 +450,7 @@ mod tests {
             },
             headscale_image: IMAGE.to_string(),
             proxy_image: "test".to_string(),
+            socat_image: "test".to_string(),
             operator_image: "test".to_string(),
             claim_default: true,
         }

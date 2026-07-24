@@ -89,14 +89,6 @@ pub fn service_proxy_state_secret_name(svc_ns: &str, svc_name: &str) -> String {
     ProxyNames::for_service(svc_ns, svc_name).state_secret_name
 }
 
-/// Returns the operator-assigned tag for an ExternalName Service with access grants.
-pub fn service_auto_tag(svc_ns: &str, svc_name: &str) -> String {
-    format!(
-        "tag:hm-{}",
-        ProxyNames::for_service(svc_ns, svc_name).proxy_base
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,14 +204,5 @@ mod tests {
         let base = ProxyNames::new("default", "my-app").proxy_base;
         let expect_hash = &hex::encode(sha2::Sha256::digest("default\x00my-app".as_bytes()))[..8];
         assert_eq!(base, format!("default-my-app-{expect_hash}"));
-    }
-
-    #[test]
-    fn service_auto_tag_format() {
-        let tag = service_auto_tag("default", "my-app");
-        assert!(
-            tag.starts_with("tag:hm-svc-default-my-app-"),
-            "tag must start with readable svc prefix: {tag}"
-        );
     }
 }
