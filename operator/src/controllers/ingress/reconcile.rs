@@ -305,16 +305,17 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
 
     let annotations = IngressAnnotations::parse(&*ingress)?;
 
-    // tailnet-fqdn is the egress Service knob; on an Ingress it can only be
-    // a copy-paste mistake, and silently ignoring it would mislead.
-    if annotations.tailnet_fqdn.is_some() {
+    // tailnet-fqdn and consumers are egress Service knobs; on an Ingress
+    // they can only be a copy-paste mistake, and silently ignoring them
+    // would mislead.
+    if annotations.tailnet_fqdn.is_some() || !annotations.consumers.is_empty() {
         let _ = ctx
             .recorder()
             .publish_warning(
                 &ingress.object_ref(&()),
                 "InvalidConfig",
-                "'tailnet-fqdn' does not apply to Ingresses; it selects the tailnet \
-                 destination of an egress ExternalName Service",
+                "'tailnet-fqdn' and 'consumers' do not apply to Ingresses; they \
+                 configure egress ExternalName Services",
             )
             .await;
         return Ok(Action::await_change());

@@ -8,5 +8,5 @@ pub use headscale_instance::{
     HeadscaleInstanceStatus, ScimSpec, StorageSpec,
 };
 pub use ingress_annotations::{
-    ANNOTATION_CONFIG, AnnotationError, IngressAccessGrant, IngressAnnotations,
+    ANNOTATION_CONFIG, AnnotationError, EgressConsumer, IngressAccessGrant, IngressAnnotations,
 };

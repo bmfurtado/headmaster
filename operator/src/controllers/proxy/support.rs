@@ -143,6 +143,12 @@ pub(crate) async fn cleanup_proxy_resources(ctx: &Context, op_ns: &str, names: &
             &names.serve_configmap_name
         ),
         del_warn(
+            // Egress consumers allowlist; ingress proxies never create one,
+            // for them this is a no-op 404.
+            Api::<k8s_openapi::api::networking::v1::NetworkPolicy>::namespaced(c.clone(), op_ns),
+            &names.proxy_name
+        ),
+        del_warn(
             Api::<RoleBinding>::namespaced(c.clone(), op_ns),
             &names.proxy_name
         ),

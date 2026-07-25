@@ -20,6 +20,12 @@ use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, PodSecurityContext, PodSpec, PodTemplateSpec,
     SeccompProfile, Secret, Service, ServicePort, ServiceSpec,
 };
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
+    NetworkPolicySpec,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::finalizer::{Event as Finalizer, finalizer};
@@ -36,7 +42,9 @@ use crate::controllers::proxy::{
 };
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
-use crate::types::{ANNOTATION_CONFIG, HeadscaleInstance, IngressAnnotations, ResourceStatus};
+use crate::types::{
+    ANNOTATION_CONFIG, EgressConsumer, HeadscaleInstance, IngressAnnotations, ResourceStatus,
+};
 
 const EXTERNAL_NAME_TYPE: &str = "ExternalName";
 const PROXY_COMPONENT: &str = "tailscale-proxy";
@@ -501,6 +509,8 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         )
         .await?;
 
+    apply_consumer_policy(ctx, &child, &names, &svc, &annotations.consumers, &forwards).await?;
+
     // Point the annotated Service at the egress proxy and record ownership.
     // spec.externalName is operator-owned on adopted Services; the user's
     // original value is a placeholder.
@@ -607,7 +617,6 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
 /// tailnet host; named target ports are meaningless there and fall back to
 /// `port`.
 fn collect_tcp_forwards(svc: &Service) -> Vec<(i32, i32)> {
-    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
     svc.spec
         .as_ref()
         .and_then(|s| s.ports.as_ref())
@@ -633,6 +642,127 @@ fn collect_tcp_forwards(svc: &Service) -> Vec<(i32, i32)> {
             (p.port, backend)
         })
         .collect()
+}
+
+/// Applies (or removes) the consumers allowlist: a NetworkPolicy on the
+/// egress proxy pods admitting ingress only from the declared consumers, on
+/// the forwarder listener ports. No `consumers` means no policy — any pod
+/// may use the egress. A nonexistent consumer namespace still renders its
+/// rule (it matches nothing) but earns a warning event, since it is usually
+/// a typo silently denying the intended pods.
+async fn apply_consumer_policy(
+    ctx: &Context,
+    child: &ChildApplier<'_>,
+    names: &ProxyNames,
+    svc: &Service,
+    consumers: &[EgressConsumer],
+    forwards: &[(i32, i32)],
+) -> Result<(), Error> {
+    if consumers.is_empty() {
+        delete_ignoring_404(
+            Api::<NetworkPolicy>::namespaced(ctx.client.clone(), &child.namespace),
+            &names.proxy_name,
+        )
+        .await?;
+        return Ok(());
+    }
+    for consumer in consumers {
+        match Api::<k8s_openapi::api::core::v1::Namespace>::all(ctx.client.clone())
+            .get(&consumer.namespace)
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(ref e)) if e.code == 404 => {
+                let _ = ctx
+                    .recorder()
+                    .publish_warning(
+                        &svc.object_ref(&()),
+                        "ConsumerNamespaceMissing",
+                        &format!(
+                            "consumers entry references namespace '{}', which does not                              exist; its pods will be denied until it does",
+                            consumer.namespace
+                        ),
+                    )
+                    .await;
+            }
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    child
+        .apply(
+            PROXY_COMPONENT,
+            build_consumer_policy(names, consumers, forwards),
+        )
+        .await?;
+    Ok(())
+}
+
+fn build_consumer_policy(
+    names: &ProxyNames,
+    consumers: &[EgressConsumer],
+    forwards: &[(i32, i32)],
+) -> NetworkPolicy {
+    let peers: Vec<NetworkPolicyPeer> = consumers
+        .iter()
+        .map(|c| NetworkPolicyPeer {
+            namespace_selector: Some(LabelSelector {
+                match_labels: Some(
+                    [(
+                        "kubernetes.io/metadata.name".to_string(),
+                        c.namespace.clone(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            }),
+            // An absent/empty pods map yields an empty podSelector: every
+            // pod in the namespace, matching the annotation's semantics.
+            pod_selector: Some(LabelSelector {
+                match_labels: c.pods.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .collect();
+    let mut policy = NetworkPolicy::default();
+    policy.metadata.name = Some(names.proxy_name.clone());
+    policy.spec = Some(NetworkPolicySpec {
+        // Selecting the proxy pods flips them to default-deny for ingress;
+        // the single rule below is the entire allowlist.
+        pod_selector: Some(LabelSelector {
+            match_labels: Some(
+                [
+                    (
+                        "app.kubernetes.io/instance".to_string(),
+                        names.proxy_base.clone(),
+                    ),
+                    (
+                        "app.kubernetes.io/name".to_string(),
+                        PROXY_COMPONENT.to_string(),
+                    ),
+                ]
+                .into(),
+            ),
+            ..Default::default()
+        }),
+        policy_types: Some(vec!["Ingress".to_string()]),
+        ingress: Some(vec![NetworkPolicyIngressRule {
+            from: Some(peers),
+            ports: Some(
+                forwards
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| NetworkPolicyPort {
+                        port: Some(IntOrString::Int(LISTEN_PORT_BASE + idx as i32)),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        }]),
+        ..Default::default()
+    });
+    policy
 }
 
 fn build_egress_statefulset(
@@ -922,6 +1052,101 @@ mod tests {
             },
         ]);
         assert_eq!(collect_tcp_forwards(&svc), vec![(853, 853)]);
+    }
+
+    // ── consumer policy tests ─────────────────────────────────────────────────
+
+    fn consumer(ns: &str, pods: Option<&[(&str, &str)]>) -> EgressConsumer {
+        EgressConsumer {
+            namespace: ns.to_string(),
+            pods: pods.map(|kv| {
+                kv.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            }),
+        }
+    }
+
+    #[test]
+    fn consumer_policy_targets_proxy_pods_and_listener_ports() {
+        let names = ProxyNames::for_service("media", "qbittorrent");
+        let policy = build_consumer_policy(
+            &names,
+            &[consumer("media", Some(&[("app", "sonarr")]))],
+            &[(443, 443), (8080, 8080)],
+        );
+        let spec = policy.spec.as_ref().unwrap();
+        assert_eq!(
+            spec.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get("app.kubernetes.io/instance")
+                .unwrap(),
+            &names.proxy_base,
+            "policy must select exactly this proxy's pods"
+        );
+        assert_eq!(
+            spec.policy_types.as_deref(),
+            Some(&["Ingress".to_string()][..])
+        );
+        let rule = &spec.ingress.as_ref().unwrap()[0];
+        let ports: Vec<_> = rule
+            .ports
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|p| p.port.clone().unwrap())
+            .collect();
+        assert_eq!(
+            ports,
+            vec![IntOrString::Int(10000), IntOrString::Int(10001)],
+            "ports must be the internal forwarder listeners, not the Service ports"
+        );
+        let peer = &rule.from.as_ref().unwrap()[0];
+        assert_eq!(
+            peer.namespace_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get("kubernetes.io/metadata.name")
+                .unwrap(),
+            "media"
+        );
+        assert_eq!(
+            peer.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get("app")
+                .unwrap(),
+            "sonarr"
+        );
+    }
+
+    #[test]
+    fn consumer_policy_namespace_wide_entry_has_empty_pod_selector() {
+        let names = ProxyNames::for_service("media", "qbittorrent");
+        let policy = build_consumer_policy(&names, &[consumer("media", None)], &[(443, 443)]);
+        let peer = &policy.spec.as_ref().unwrap().ingress.as_ref().unwrap()[0]
+            .from
+            .as_ref()
+            .unwrap()[0];
+        assert!(
+            peer.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .is_none_or(|m| m.is_empty()),
+            "namespace-wide consumer must select every pod in the namespace"
+        );
     }
 
     // ── adoption gate tests ───────────────────────────────────────────────────

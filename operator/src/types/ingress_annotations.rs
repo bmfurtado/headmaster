@@ -43,6 +43,20 @@ pub struct IngressAccessGrant {
     pub capabilities: Option<BTreeMap<String, Vec<serde_json::Value>>>,
 }
 
+/// One entry in the `consumers` list of an egress Service annotation: pods
+/// allowed to reach the egress proxy. Enforced as an operator-generated
+/// NetworkPolicy on the proxy pods.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct EgressConsumer {
+    /// Namespace the consumer pods live in.
+    pub namespace: String,
+    /// Pod label selector within that namespace. Absent or empty means every
+    /// pod in the namespace.
+    #[serde(default)]
+    pub pods: Option<BTreeMap<String, String>>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct IngressAnnotations {
@@ -75,6 +89,12 @@ pub struct IngressAnnotations {
     /// actual tailnet destination.
     #[serde(default)]
     pub tailnet_fqdn: Option<String>,
+    /// Egress only: pods allowed to reach the egress proxy, enforced as an
+    /// operator-generated NetworkPolicy. Absent means no policy — any pod in
+    /// the cluster may use the egress (the pre-feature behavior). Rejected
+    /// on Ingresses.
+    #[serde(default)]
+    pub consumers: Vec<EgressConsumer>,
     #[serde(default)]
     pub access: Vec<IngressAccessGrant>,
 }
@@ -244,6 +264,47 @@ mod tests {
         let ingress = ingress_with_config(serde_json::json!({"host-network": true}));
         let parsed = IngressAnnotations::parse(&ingress).expect("must parse with host-network");
         assert!(parsed.host_network);
+    }
+
+    #[test]
+    fn annotation_parse_consumers_default_empty() {
+        let ingress = ingress_with_config(serde_json::json!({}));
+        let parsed = IngressAnnotations::parse(&ingress).expect("must parse");
+        assert!(parsed.consumers.is_empty());
+    }
+
+    #[test]
+    fn annotation_parse_consumers_entries() {
+        let ingress = ingress_with_config(serde_json::json!({
+            "consumers": [
+                {"namespace": "media", "pods": {"app": "sonarr"}},
+                {"namespace": "media"}
+            ]
+        }));
+        let parsed = IngressAnnotations::parse(&ingress).expect("must parse");
+        assert_eq!(parsed.consumers.len(), 2);
+        assert_eq!(parsed.consumers[0].namespace, "media");
+        assert_eq!(
+            parsed.consumers[0]
+                .pods
+                .as_ref()
+                .unwrap()
+                .get("app")
+                .unwrap(),
+            "sonarr"
+        );
+        assert!(parsed.consumers[1].pods.is_none(), "namespace-wide entry");
+    }
+
+    #[test]
+    fn annotation_parse_consumer_unknown_field_rejected() {
+        let ingress = ingress_with_config(serde_json::json!({
+            "consumers": [{"namespace": "media", "unknown": true}]
+        }));
+        assert!(matches!(
+            IngressAnnotations::parse(&ingress),
+            Err(AnnotationError::Invalid(_, _))
+        ));
     }
 
     #[test]
