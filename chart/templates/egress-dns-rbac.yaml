@@ -1,7 +1,9 @@
 {{- if .Values.egressDns.corednsCustom }}
-# Egress DNS: the operator owns one key in kube-system/coredns-custom.
-# create cannot be constrained by resourceName, so it is granted on
-# configmaps in kube-system broadly; mutation stays pinned to the one name.
+# Egress DNS: the operator owns one key in kube-system/coredns-custom and
+# watches the ConfigMap to resync after external changes. create/list/watch
+# cannot be constrained by resourceName (and the watcher needs the initial
+# list), so those are granted on configmaps in kube-system broadly;
+# mutation stays pinned to the one name.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -12,7 +14,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["create"]
+    verbs: ["create", "list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["coredns-custom"]
