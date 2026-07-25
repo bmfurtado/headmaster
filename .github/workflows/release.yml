@@ -96,6 +96,11 @@ jobs:
       - name: Attach chart to GitHub Release
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release upload "${{ github.ref_name }}" "headmaster-${VERSION}.tgz"
+          # release-please only creates Releases for its own tags; create one
+          # for manually-pushed tags so the upload has somewhere to go.
+          if ! gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release create "${{ github.ref_name }}" --generate-notes
+          fi
+          gh release upload "${{ github.ref_name }}" "headmaster-${VERSION}.tgz" --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
