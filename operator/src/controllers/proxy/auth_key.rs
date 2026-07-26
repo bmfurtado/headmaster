@@ -113,7 +113,7 @@ pub(crate) async fn rotate_stale_auth_key(
         .metadata
         .creation_timestamp
         .as_ref()
-        .map(|t| t.0.timestamp());
+        .map(|t| t.0.as_second());
     let expired = minted_at.is_some_and(|created| {
         created.saturating_add(i64::try_from(expiry_secs).unwrap_or(i64::MAX)) < now_epoch_secs()
     });
