@@ -305,6 +305,15 @@ The `mode` field selects how traffic is forwarded:
   If the ClusterIP ever changes, the operator re-renders the pod and rolls
   it. Headless Services can't be exposed in tun mode (nothing to DNAT to).
 
+`"mode": "tun"` is also accepted on an **Ingress**. There the proxy keeps
+its full serve pipeline — path routing, multiple backends, capability
+headers — and only the packet path changes: the same serve config runs on a
+kernel-mode tailscaled instead of netstack, lifting the userspace throughput
+ceiling without giving up any Ingress feature. In short, `mode` always means
+"more performant, but the pod needs the TUN device"; the operator picks the
+data plane that preserves the parent object's semantics (Ingress → serve on
+kernel networking, Service → pure DNAT).
+
 tun-mode pods need `/dev/net/tun`, granted per the chart's `tunDevice`
 values:
 
@@ -322,11 +331,10 @@ values:
 Notes:
 
 - tun-mode nodes register with an **ephemeral** pre-auth key: the operator
-  deletes the headscale node on Service deletion anyway, and ephemeral
+  deletes the headscale node on parent deletion anyway, and ephemeral
   expiry is the backstop if that delete is ever missed.
-- `host-network` applies to tsnet mode only (it behaves exactly like on an
-  Ingress); in tun mode it is ignored with a warning — the TUN device must
-  stay inside the pod's network namespace.
+- `host-network` applies to tsnet mode only; in tun mode it is ignored with
+  a warning — the TUN device must stay inside the pod's network namespace.
 - `access` grants are not supported on exposed Services yet; grant access to
   the proxy's tag in the tailnet ACL instead.
 

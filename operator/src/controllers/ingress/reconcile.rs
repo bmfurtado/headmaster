@@ -350,19 +350,23 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         return Ok(Action::await_change());
     }
 
-    // Ingress proxies always run the userspace serve path: `mode` selects
-    // the forwarding flavor of an exposed Service, nothing else.
-    if annotations.mode != ProxyMode::Tsnet {
-        let _ = ctx
-            .recorder()
-            .publish_warning(
-                &ingress.object_ref(&()),
-                "IgnoredConfig",
-                "'mode' does not apply to Ingresses; it selects how an exposed \
-                 (non-ExternalName) Service is forwarded",
-            )
-            .await;
-    }
+    // A host-networked kernel tailscaled would put the TUN device in the
+    // node's own network namespace, fighting the node's tailscaled. tun-mode
+    // proxies always stay on the pod network.
+    let host_network = match annotations.mode {
+        ProxyMode::Tun if annotations.host_network => {
+            let _ = ctx
+                .recorder()
+                .publish_warning(
+                    &ingress.object_ref(&()),
+                    "IgnoredConfig",
+                    "'host-network' does not apply to tun-mode proxies; ignored",
+                )
+                .await;
+            false
+        }
+        _ => annotations.host_network,
+    };
 
     if namespace_is_deleting(&ctx.client, &ingress_ns).await? {
         tracing::info!(
@@ -528,7 +532,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
 
     let mut headscale = headscale_connect(ctx, op_ns, &annotations.headscale_ref).await?;
 
-    let networking = apply_wireguard_service(&child, &names, annotations.host_network).await?;
+    let networking = apply_wireguard_service(&child, &names, host_network).await?;
 
     // If headscale_ref changed, deregister from old HI and reset secrets before ensure_auth_key.
     let retarget = match Api::<Secret>::namespaced(ctx.client.clone(), op_ns)
@@ -600,7 +604,10 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         auto_tag.as_deref(),
         annotations.auth_key_expiry_secs,
         annotations.auth_key_reusable,
-        false,
+        // tun nodes register with an ephemeral key: if the explicit node
+        // delete on teardown is ever missed, headscale garbage-collects the
+        // node once it goes offline.
+        annotations.mode == ProxyMode::Tun,
     )
     .await?
     {
@@ -621,6 +628,12 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         &login_url,
         &annotations.hostname,
         &networking,
+        // tun mode: the same serve pipeline on a kernel tailscaled, for
+        // throughput beyond what netstack manages.
+        match annotations.mode {
+            ProxyMode::Tun => Some(&ctx.tun_device),
+            ProxyMode::Tsnet => None,
+        },
     )
     .await?;
 

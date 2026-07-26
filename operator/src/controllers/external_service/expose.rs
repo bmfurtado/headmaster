@@ -282,6 +282,7 @@ pub(super) async fn apply_expose(svc: Arc<Service>, ctx: &Context) -> Result<Act
                 &login_url,
                 &annotations.hostname,
                 &networking,
+                None,
             )
             .await?;
         }

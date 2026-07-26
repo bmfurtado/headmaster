@@ -43,18 +43,23 @@ pub struct IngressAccessGrant {
     pub capabilities: Option<BTreeMap<String, Vec<serde_json::Value>>>,
 }
 
-/// How an exposed Service's proxy forwards traffic onto the tailnet node.
+/// The proxy's packet path: userspace netstack (unprivileged) or a kernel
+/// TUN device (faster, needs /dev/net/tun — see the operator's tunDevice
+/// config). The data plane follows the parent object's contract: an Ingress
+/// keeps its full serve pipeline in either mode, while an exposed Service in
+/// tun mode is DNAT-forwarded entirely in-kernel.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyMode {
-    /// Userspace tailscaled (netstack): traffic is forwarded via the proxy's
-    /// serve config. No special privileges, works everywhere. The default.
+    /// Userspace tailscaled (netstack). No special privileges, works
+    /// everywhere; throughput is bounded by the userspace network stack.
+    /// The default.
     #[default]
     Tsnet,
-    /// Kernel forwarding: real tailscaled with a TUN device, DNAT-ing tailnet
-    /// traffic to the Service's ClusterIP. Much higher throughput; the proxy
-    /// pod needs access to /dev/net/tun (see the operator's tunDevice config).
-    /// Only meaningful on exposed ClusterIP Services.
+    /// Kernel-mode tailscaled with a TUN device. On an Ingress the serve
+    /// config (path routing, capability headers) runs unchanged on the
+    /// kernel packet path; on an exposed Service, tailnet traffic is
+    /// DNAT-ed to the ClusterIP — protocol-agnostic, UDP included.
     Tun,
 }
 
@@ -112,10 +117,10 @@ pub struct IngressAnnotations {
     pub consumers: Vec<EgressConsumer>,
     #[serde(default)]
     pub access: Vec<IngressAccessGrant>,
-    /// Exposed ClusterIP Services only: how the proxy forwards traffic.
-    /// `tsnet` (default) runs a userspace proxy; `tun` runs a kernel-mode
-    /// tailscaled with a TUN device for high-bandwidth workloads. Ignored on
-    /// Ingresses and egress (ExternalName) Services.
+    /// The proxy's packet path: `tsnet` (default) runs userspace tailscaled,
+    /// unprivileged; `tun` runs kernel-mode tailscaled with a TUN device for
+    /// high-bandwidth workloads. Applies to Ingresses and exposed Services;
+    /// ignored on egress (ExternalName) Services.
     #[serde(default)]
     pub mode: ProxyMode,
 }

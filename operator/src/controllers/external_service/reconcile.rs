@@ -357,8 +357,8 @@ async fn apply_egress(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error>
             .publish_warning(
                 &svc.object_ref(&()),
                 "IgnoredConfig",
-                "'mode' does not apply to egress proxies; it selects how an \
-                 exposed (non-ExternalName) Service is forwarded",
+                "'mode' does not apply to egress proxies; it selects the \
+                 packet path for Ingress and exposed Service proxies",
             )
             .await;
     }

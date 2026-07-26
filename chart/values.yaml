@@ -14,8 +14,8 @@ socatImage:
   tag: 1.8.0.3
 
 tunDevice:
-  # How tun-mode proxy pods (Services exposed with "mode": "tun") get access
-  # to /dev/net/tun.
+  # How tun-mode proxy pods (Ingresses or exposed Services with
+  # "mode": "tun") get access to /dev/net/tun.
   #   privileged    — privileged container + hostPath /dev/net/tun (default).
   #   device-plugin — request one devicePluginResource unit and add only
   #                   CAP_NET_ADMIN; needs a device plugin advertising the
