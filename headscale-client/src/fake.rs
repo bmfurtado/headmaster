@@ -300,9 +300,19 @@ impl HeadscaleService for FakeHeadscaleServer {
     }
     async fn get_node(
         &self,
-        _: Request<GetNodeRequest>,
+        req: Request<GetNodeRequest>,
     ) -> Result<Response<GetNodeResponse>, Status> {
-        not_needed()
+        let id = req.into_inner().node_id;
+        let node = self
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("node {id} not found")))?;
+        Ok(Response::new(GetNodeResponse { node: Some(node) }))
     }
     async fn set_tags(
         &self,

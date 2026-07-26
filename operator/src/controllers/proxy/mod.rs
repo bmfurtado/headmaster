@@ -16,7 +16,7 @@ pub use names::{
     service_proxy_sts_name,
 };
 
-pub(crate) use auth_key::{AuthKeyStatus, ensure_auth_key};
+pub(crate) use auth_key::{AuthKeyStatus, ensure_auth_key, rotate_stale_auth_key};
 pub(crate) use error::Error;
 pub(crate) use names::ProxyNames;
 pub(crate) use resources::{

@@ -38,7 +38,7 @@ use crate::controllers::applier::{ChildApplier, delete_ignoring_404};
 use crate::controllers::proxy::{
     AuthKeyStatus, Error, ProxyNames, apply_proxy_rbac, cleanup_proxy_resources,
     deregister_and_cleanup, ensure_auth_key, ensure_state_secret, headscale_connect,
-    namespace_is_deleting, read_secret_json, read_secret_string,
+    namespace_is_deleting, read_secret_json, read_secret_string, rotate_stale_auth_key,
 };
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
@@ -107,6 +107,30 @@ pub fn stream(
                 }
                 let svc_name = secret.labels().get(labels::INGRESS_NAME)?.clone();
                 let svc_ns = secret.labels().get(labels::INGRESS_NAMESPACE)?.clone();
+                Some(ObjectRef::<Service>::new(&svc_name).within(&svc_ns))
+            },
+        )
+        .watches(
+            // The proxy StatefulSets this controller creates. They can't carry
+            // an ownerReference to the Service (it lives in another namespace),
+            // so kube-rs `owns` can't see them — without this watch, deleting a
+            // proxy STS produces no event that maps back to the Service, and
+            // the reconciler's `await_change` waits forever instead of
+            // recreating it (bitten 2026-07-26).
+            Api::<StatefulSet>::namespaced(ctx.client.clone(), &ctx.operator_namespace),
+            watcher::Config::default().labels(&format!(
+                "{}={}",
+                labels::APP_MANAGED_BY,
+                labels::MANAGED_BY_VALUE
+            )),
+            |sts| {
+                if sts.labels().get(labels::PARENT_KIND).map(String::as_str)
+                    != Some(labels::PARENT_KIND_SERVICE)
+                {
+                    return None;
+                }
+                let svc_name = sts.labels().get(labels::INGRESS_NAME)?.clone();
+                let svc_ns = sts.labels().get(labels::INGRESS_NAMESPACE)?.clone();
                 Some(ObjectRef::<Service>::new(&svc_name).within(&svc_ns))
             },
         )
@@ -450,6 +474,19 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         )
         .await?;
     }
+
+    // A proxy that lost its headscale registration (or whose key expired
+    // before it ever joined) is stuck on a dead key; clear the stale Secrets
+    // so ensure_auth_key below mints a fresh one this same reconcile.
+    rotate_stale_auth_key(
+        ctx,
+        op_ns,
+        &svc.object_ref(&()),
+        &mut headscale,
+        &names,
+        annotations.auth_key_expiry_secs,
+    )
+    .await?;
 
     if let AuthKeyStatus::WaitingForUser = ensure_auth_key(
         ctx,
