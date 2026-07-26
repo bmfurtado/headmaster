@@ -8,6 +8,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use headscale_client::Code;
 use headscale_client::headscale::v1::{DeleteNodeRequest, SetTagsRequest};
+use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass, IngressClassSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -27,6 +28,7 @@ use crate::controllers::proxy::{
     apply_serve_configmap, apply_wireguard_service, cleanup_proxy_resources,
     deregister_and_cleanup, ensure_auth_key, ensure_state_secret, headscale_connect,
     ingress_auto_tag, namespace_is_deleting, read_secret_json, read_secret_string,
+    rotate_stale_auth_key,
 };
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
@@ -138,6 +140,33 @@ pub fn stream(
                 }
                 let ingress_name = secret.labels().get(labels::INGRESS_NAME)?.clone();
                 let ingress_ns = secret.labels().get(labels::INGRESS_NAMESPACE)?.clone();
+                Some(ObjectRef::<Ingress>::new(&ingress_name).within(&ingress_ns))
+            },
+        )
+        .watches(
+            // The proxy StatefulSets this controller creates. They can't carry
+            // an ownerReference to the Ingress (it lives in another namespace),
+            // so kube-rs `owns` can't see them — without this watch, deleting a
+            // proxy STS produces no event that maps back to the Ingress, and
+            // the reconciler's `await_change` waits forever instead of
+            // recreating it (bitten 2026-07-26, on the egress twin of this).
+            Api::<StatefulSet>::namespaced(ctx.client.clone(), &ctx.operator_namespace),
+            watcher::Config::default().labels(&format!(
+                "{}={}",
+                labels::APP_MANAGED_BY,
+                labels::MANAGED_BY_VALUE
+            )),
+            |sts| {
+                // Absent PARENT_KIND means an ingress child from before the
+                // label existed; "service" children belong to the
+                // ExternalName Service controller.
+                match sts.labels().get(labels::PARENT_KIND) {
+                    None => {}
+                    Some(k) if k == labels::PARENT_KIND_INGRESS => {}
+                    Some(_) => return None,
+                }
+                let ingress_name = sts.labels().get(labels::INGRESS_NAME)?.clone();
+                let ingress_ns = sts.labels().get(labels::INGRESS_NAMESPACE)?.clone();
                 Some(ObjectRef::<Ingress>::new(&ingress_name).within(&ingress_ns))
             },
         )
@@ -531,6 +560,19 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         )
         .await?;
     }
+
+    // A proxy that lost its headscale registration (or whose key expired
+    // before it ever joined) is stuck on a dead key; clear the stale Secrets
+    // so ensure_auth_key below mints a fresh one this same reconcile.
+    rotate_stale_auth_key(
+        ctx,
+        op_ns,
+        &ingress.object_ref(&()),
+        &mut headscale,
+        &names,
+        annotations.auth_key_expiry_secs,
+    )
+    .await?;
 
     if let AuthKeyStatus::WaitingForUser = ensure_auth_key(
         ctx,
