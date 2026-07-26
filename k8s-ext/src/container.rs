@@ -51,6 +51,22 @@ pub trait ContainerExt: Sized {
             .extend(drop);
         self
     }
+
+    fn add_capabilities(mut self, capabilities: impl IntoIterator<Item = impl ToString>) -> Self {
+        let add = capabilities.into_iter().map(|item| item.to_string());
+        self.security_context_mut()
+            .capabilities
+            .get_or_insert_default()
+            .add
+            .get_or_insert_default()
+            .extend(add);
+        self
+    }
+
+    fn privileged(mut self, yes: bool) -> Self {
+        self.security_context_mut().privileged = Some(yes);
+        self
+    }
 }
 
 impl ContainerExt for corev1::Container {

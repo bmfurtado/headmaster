@@ -13,6 +13,19 @@ socatImage:
   repository: alpine/socat
   tag: 1.8.0.3
 
+tunDevice:
+  # How tun-mode proxy pods (Ingresses or exposed Services with
+  # "mode": "tun") get access to /dev/net/tun.
+  #   privileged    — privileged container + hostPath /dev/net/tun (default).
+  #   device-plugin — request one devicePluginResource unit and add only
+  #                   CAP_NET_ADMIN; needs a device plugin advertising the
+  #                   resource (e.g. squat/generic-device-plugin) and the
+  #                   kubelet to allow the net.ipv4.ip_forward and
+  #                   net.ipv6.conf.all.forwarding sysctls.
+  access: privileged
+  # Extended-resource name requested in device-plugin mode.
+  devicePluginResource: squat.ai/tun
+
 egressDns:
   # Maintain a `headmaster-egress.override` key in the kube-system
   # coredns-custom ConfigMap with one rewrite per egress Service, so pods

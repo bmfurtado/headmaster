@@ -14,13 +14,15 @@ use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, EnvVar, PodSecurityContext, PodSpec,
     PodTemplateSpec, SeccompProfile, Secret, Service, ServiceAccount, ServicePort, ServiceSpec,
-    Volume, VolumeMount,
+    Sysctl, Volume, VolumeMount,
 };
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, Subject};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::Api;
 
 use super::Error;
 use super::names::ProxyNames;
+use crate::context::TunDeviceAccess;
 use crate::controllers::applier::{ChildApplier, delete_ignoring_404};
 
 const WIREGUARD_POD_PORT: i32 = 41641;
@@ -194,22 +196,38 @@ pub(crate) async fn apply_proxy_statefulset(
     headscale_url: &str,
     hostname: &str,
     networking: &ProxyNetworking,
+    tun_device: Option<&TunDeviceAccess>,
 ) -> Result<(), Error> {
     child
         .apply_statefulset(
             PROXY_COMPONENT,
-            build_proxy_statefulset(names, proxy_image, headscale_url, hostname, networking),
+            build_proxy_statefulset(
+                names,
+                proxy_image,
+                headscale_url,
+                hostname,
+                networking,
+                tun_device,
+            ),
         )
         .await?;
     Ok(())
 }
 
+/// Serve-config proxy StatefulSet. With `tun_device: None` tailscaled runs
+/// in userspace/netstack mode — no privileges needed. With `Some`, the same
+/// serve pipeline (path routing, capability headers) runs on a kernel-mode
+/// tailscaled with a TUN device instead: identical features, without the
+/// userspace network stack's throughput ceiling. Kernel mode is only valid
+/// on the pod network — callers must not combine it with host networking,
+/// where the TUN device would land in the node's own network namespace.
 fn build_proxy_statefulset(
     names: &ProxyNames,
     proxy_image: &str,
     headscale_url: &str,
     hostname: &str,
     networking: &ProxyNetworking,
+    tun_device: Option<&TunDeviceAccess>,
 ) -> StatefulSet {
     let serve_config_volume = Volume::configmap(
         "serve-config",
@@ -243,7 +261,14 @@ fn build_proxy_statefulset(
             },
         ),
         EnvVar::value("TS_SERVE_CONFIG", SERVE_CONFIG_PATH),
-        EnvVar::value("TS_USERSPACE", "true"),
+        EnvVar::value(
+            "TS_USERSPACE",
+            if tun_device.is_some() {
+                "false"
+            } else {
+                "true"
+            },
+        ),
         EnvVar::value("TS_KUBE_SECRET", &names.state_secret_name),
         EnvVar::metadata_name("POD_NAME"),
         EnvVar::metadata_namespace("POD_NAMESPACE"),
@@ -257,10 +282,21 @@ fn build_proxy_statefulset(
     }
     let container = Container::new("proxy")
         .image(proxy_image)
-        .allow_privilege_escalation(false)
-        .drop_capabilities(["ALL"])
         .env(env)
         .volume_mounts([VolumeMount::new(SERVE_CONFIG_MOUNT, &serve_config_volume).read_only()]);
+    let mut volumes = vec![serve_config_volume];
+    let mut sysctls = None;
+    let container = match tun_device {
+        None => container
+            .allow_privilege_escalation(false)
+            .drop_capabilities(["ALL"]),
+        Some(access) => {
+            let (container, tun_volumes, tun_sysctls) = grant_tun_device(container, access);
+            volumes.extend(tun_volumes);
+            sysctls = tun_sysctls;
+            container
+        }
+    };
     let (host_network, dns_policy) = match networking {
         // ClusterFirstWithHostNet: a hostNetwork pod otherwise inherits the
         // node's resolv.conf and cannot resolve the backend Service names in
@@ -276,16 +312,156 @@ fn build_proxy_statefulset(
                 type_: "RuntimeDefault".into(),
                 localhost_profile: None,
             }),
+            sysctls,
             ..Default::default()
         }),
         ..PodSpec::container(container)
             .service_account_name(&names.proxy_name)
-            .volumes([serve_config_volume])
+            .volumes(volumes)
     };
     StatefulSet::new(&names.proxy_name)
         .replicas(1)
         .service_name(&names.wg_service_name)
         .template(PodTemplateSpec::new().pod_spec(pod_spec))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_tun_proxy_statefulset(
+    child: &ChildApplier<'_>,
+    names: &ProxyNames,
+    proxy_image: &str,
+    headscale_url: &str,
+    hostname: &str,
+    dest_ip: &str,
+    node_port: i32,
+    tun_device: &TunDeviceAccess,
+) -> Result<(), Error> {
+    child
+        .apply_statefulset(
+            PROXY_COMPONENT,
+            build_tun_statefulset(
+                names,
+                proxy_image,
+                headscale_url,
+                hostname,
+                dest_ip,
+                node_port,
+                tun_device,
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Kernel-forwarding flavor of the proxy StatefulSet: a real tailscaled with
+/// a TUN device (`TS_USERSPACE=false`) DNAT-ing all tailnet traffic for this
+/// node to `dest_ip` (`TS_DEST_IP`), instead of a netstack proxy with a serve
+/// config. Always runs on the pod network with the WireGuard NodePort
+/// Service: `hostNetwork` would put the TUN device and forwarding rules in
+/// the node's own network namespace, fighting the node's tailscaled.
+fn build_tun_statefulset(
+    names: &ProxyNames,
+    proxy_image: &str,
+    headscale_url: &str,
+    hostname: &str,
+    dest_ip: &str,
+    node_port: i32,
+    tun_device: &TunDeviceAccess,
+) -> StatefulSet {
+    let env = vec![
+        EnvVar::secret_key_ref("TS_AUTHKEY", &names.config_secret_name, "key"),
+        EnvVar::value("TS_HOSTNAME", hostname),
+        // TS_EXTRA_ARGS → passed to `tailscale up` (CLI flags only).
+        EnvVar::value(
+            "TS_EXTRA_ARGS",
+            format!(
+                "--login-server={headscale_url} \
+                 --advertise-exit-node=false \
+                 --snat-subnet-routes=false \
+                 --stateful-filtering=false"
+            ),
+        ),
+        // Pin tailscaled to the NodePort Service targetPort, same as the
+        // netstack NodePort flavor.
+        EnvVar::value(
+            "TS_TAILSCALED_EXTRA_ARGS",
+            format!("--port={WIREGUARD_POD_PORT} --socket=/tmp/tailscaled.sock"),
+        ),
+        EnvVar::value("TS_USERSPACE", "false"),
+        EnvVar::value("TS_DEST_IP", dest_ip),
+        EnvVar::value("TS_KUBE_SECRET", &names.state_secret_name),
+        EnvVar::metadata_name("POD_NAME"),
+        EnvVar::metadata_namespace("POD_NAMESPACE"),
+        EnvVar::status_host_ip("NODE_IP"),
+        EnvVar::value("NODE_PORT", node_port.to_string()),
+        EnvVar::value("TS_DEBUG_PRETENDPOINT", "$(NODE_IP):$(NODE_PORT)"),
+    ];
+    let container = Container::new("proxy").image(proxy_image).env(env);
+    let (container, volumes, sysctls) = grant_tun_device(container, tun_device);
+    let pod_spec = PodSpec {
+        security_context: Some(PodSecurityContext {
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".into(),
+                localhost_profile: None,
+            }),
+            sysctls,
+            ..Default::default()
+        }),
+        ..PodSpec::container(container)
+            .service_account_name(&names.proxy_name)
+            .volumes(volumes)
+    };
+    StatefulSet::new(&names.proxy_name)
+        .replicas(1)
+        .service_name(&names.wg_service_name)
+        .template(PodTemplateSpec::new().pod_spec(pod_spec))
+}
+
+/// Grants a kernel-mode proxy container access to /dev/net/tun per the
+/// operator's configured variant. Returns the (possibly privileged)
+/// container plus the extra pod volumes and pod-level sysctls the variant
+/// needs merged into the pod spec.
+fn grant_tun_device(
+    container: Container,
+    tun_device: &TunDeviceAccess,
+) -> (Container, Vec<Volume>, Option<Vec<Sysctl>>) {
+    match tun_device {
+        TunDeviceAccess::Privileged => {
+            // Privileged mounts /proc/sys read-write, so containerboot
+            // enables IP forwarding itself. The explicit hostPath mount keeps
+            // the pod working on runtimes that don't expose all host devices
+            // to privileged containers.
+            let tun_volume = Volume::hostpath("dev-net-tun", "/dev/net/tun", "CharDevice");
+            let mut container = container.privileged(true);
+            container
+                .volume_mounts
+                .get_or_insert_default()
+                .push(VolumeMount::new("/dev/net/tun", &tun_volume));
+            (container, vec![tun_volume], None)
+        }
+        TunDeviceAccess::DevicePlugin { resource } => {
+            // The device plugin injects /dev/net/tun; NET_ADMIN is all
+            // tailscaled needs on top. containerboot cannot write /proc/sys
+            // in a non-privileged container, so IP forwarding comes from pod
+            // sysctls — the kubelet must allow these two (unsafe) sysctls.
+            let container = container
+                .allow_privilege_escalation(false)
+                .drop_capabilities(["ALL"])
+                .add_capabilities(["NET_ADMIN"])
+                .resource_limits([(resource.clone(), Quantity("1".to_string()))]);
+            let sysctls = vec![
+                Sysctl {
+                    name: "net.ipv4.ip_forward".to_string(),
+                    value: "1".to_string(),
+                },
+                Sysctl {
+                    name: "net.ipv6.conf.all.forwarding".to_string(),
+                    value: "1".to_string(),
+                },
+            ];
+            (container, Vec::new(), Some(sysctls))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +502,7 @@ mod tests {
             "https://headscale.example.com",
             "my-app",
             networking,
+            None,
         )
     }
 
@@ -446,6 +623,238 @@ mod tests {
             env_of(&sts, "TS_TAILSCALED_EXTRA_ARGS").and_then(|e| e.value.as_deref()),
             Some("--port=0 --socket=/tmp/tailscaled.sock"),
             "Host mode must auto-select the UDP port; 41641 belongs to the node's tailscaled"
+        );
+    }
+
+    // ── kernel-mode serve StatefulSet tests ────────────────────────────────────
+
+    #[test]
+    fn serve_statefulset_kernel_mode_keeps_serve_config() {
+        let names = ProxyNames::new("default", "my-app");
+        let sts = build_proxy_statefulset(
+            &names,
+            "tailscale/tailscale:stable",
+            "https://headscale.example.com",
+            "my-app",
+            &ProxyNetworking::NodePort { node_port: 30123 },
+            Some(&TunDeviceAccess::Privileged),
+        );
+        assert_eq!(
+            env_of(&sts, "TS_USERSPACE").and_then(|e| e.value.as_deref()),
+            Some("false"),
+            "kernel mode must disable userspace/netstack networking"
+        );
+        assert_eq!(
+            env_of(&sts, "TS_SERVE_CONFIG").and_then(|e| e.value.as_deref()),
+            Some(SERVE_CONFIG_PATH),
+            "kernel mode must keep the serve config — same features, faster packet path"
+        );
+        assert!(
+            env_of(&sts, "TS_DEST_IP").is_none(),
+            "serve-based proxies must not DNAT"
+        );
+        let proxy = pod_spec_of(&sts)
+            .containers
+            .iter()
+            .find(|c| c.name == "proxy")
+            .unwrap();
+        assert_eq!(
+            proxy.security_context.as_ref().and_then(|s| s.privileged),
+            Some(true),
+            "privileged variant must run the container privileged"
+        );
+        let mounts: Vec<_> = proxy
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.mount_path.as_str())
+            .collect();
+        assert!(
+            mounts.contains(&SERVE_CONFIG_MOUNT) && mounts.contains(&"/dev/net/tun"),
+            "kernel mode must mount both the serve config and the TUN device: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn serve_statefulset_kernel_device_plugin_sets_sysctls() {
+        let names = ProxyNames::new("default", "my-app");
+        let sts = build_proxy_statefulset(
+            &names,
+            "tailscale/tailscale:stable",
+            "https://headscale.example.com",
+            "my-app",
+            &ProxyNetworking::NodePort { node_port: 30123 },
+            Some(&TunDeviceAccess::DevicePlugin {
+                resource: "squat.ai/tun".to_string(),
+            }),
+        );
+        let sysctls = pod_spec_of(&sts)
+            .security_context
+            .as_ref()
+            .and_then(|s| s.sysctls.as_ref())
+            .expect("device-plugin variant must enable forwarding via pod sysctls");
+        assert!(
+            sysctls.iter().any(|s| s.name == "net.ipv4.ip_forward"),
+            "pod sysctls must enable IPv4 forwarding"
+        );
+    }
+
+    #[test]
+    fn serve_statefulset_userspace_mode_stays_unprivileged() {
+        let names = ProxyNames::new("default", "my-app");
+        let sts = make_proxy_statefulset(&names, &ProxyNetworking::NodePort { node_port: 30123 });
+        assert_eq!(
+            env_of(&sts, "TS_USERSPACE").and_then(|e| e.value.as_deref()),
+            Some("true"),
+            "without a tun grant the proxy must stay in userspace mode"
+        );
+        let proxy = pod_spec_of(&sts)
+            .containers
+            .iter()
+            .find(|c| c.name == "proxy")
+            .unwrap();
+        assert_ne!(
+            proxy.security_context.as_ref().and_then(|s| s.privileged),
+            Some(true),
+            "userspace proxies must never be privileged"
+        );
+    }
+
+    // ── tun StatefulSet structure tests ────────────────────────────────────────
+
+    fn make_tun_statefulset(tun_device: &TunDeviceAccess) -> StatefulSet {
+        build_tun_statefulset(
+            &ProxyNames::for_service("default", "my-app"),
+            "tailscale/tailscale:stable",
+            "https://headscale.example.com",
+            "my-app",
+            "10.43.0.15",
+            30123,
+            tun_device,
+        )
+    }
+
+    fn proxy_container_of(sts: &StatefulSet) -> &Container {
+        pod_spec_of(sts)
+            .containers
+            .iter()
+            .find(|c| c.name == "proxy")
+            .expect("tun StatefulSet must have a proxy container")
+    }
+
+    #[test]
+    fn tun_statefulset_runs_kernel_tailscaled_with_dnat() {
+        let sts = make_tun_statefulset(&TunDeviceAccess::Privileged);
+        assert_eq!(
+            env_of(&sts, "TS_USERSPACE").and_then(|e| e.value.as_deref()),
+            Some("false"),
+            "tun mode must disable userspace/netstack networking"
+        );
+        assert_eq!(
+            env_of(&sts, "TS_DEST_IP").and_then(|e| e.value.as_deref()),
+            Some("10.43.0.15"),
+            "tun mode must DNAT tailnet traffic to the Service ClusterIP"
+        );
+        assert!(
+            env_of(&sts, "TS_SERVE_CONFIG").is_none(),
+            "tun mode forwards in-kernel; it must not carry a serve config"
+        );
+        assert!(
+            pod_spec_of(&sts).host_network.is_none(),
+            "tun mode must stay on the pod network"
+        );
+        assert_eq!(
+            env_of(&sts, "NODE_PORT").and_then(|e| e.value.as_deref()),
+            Some("30123"),
+            "tun mode must advertise the WireGuard NodePort endpoint"
+        );
+        assert!(
+            env_of(&sts, "TS_DEBUG_PRETENDPOINT").is_some(),
+            "tun mode must advertise the node endpoint like the netstack NodePort flavor"
+        );
+    }
+
+    #[test]
+    fn tun_statefulset_privileged_variant_mounts_dev_net_tun() {
+        let sts = make_tun_statefulset(&TunDeviceAccess::Privileged);
+        let proxy = proxy_container_of(&sts);
+        assert_eq!(
+            proxy.security_context.as_ref().and_then(|s| s.privileged),
+            Some(true),
+            "privileged variant must run the container privileged"
+        );
+        let mount = proxy
+            .volume_mounts
+            .as_ref()
+            .and_then(|m| m.iter().find(|m| m.mount_path == "/dev/net/tun"))
+            .expect("privileged variant must mount /dev/net/tun");
+        let volume = pod_spec_of(&sts)
+            .volumes
+            .as_ref()
+            .and_then(|v| v.iter().find(|v| v.name == mount.name))
+            .expect("the /dev/net/tun mount must have a matching volume");
+        assert_eq!(
+            volume.host_path.as_ref().map(|h| h.path.as_str()),
+            Some("/dev/net/tun"),
+            "the TUN volume must be a hostPath to /dev/net/tun"
+        );
+    }
+
+    #[test]
+    fn tun_statefulset_device_plugin_variant_is_unprivileged() {
+        let sts = make_tun_statefulset(&TunDeviceAccess::DevicePlugin {
+            resource: "squat.ai/tun".to_string(),
+        });
+        let proxy = proxy_container_of(&sts);
+        let sec = proxy
+            .security_context
+            .as_ref()
+            .expect("device-plugin variant must set a security context");
+        assert_ne!(
+            sec.privileged,
+            Some(true),
+            "device-plugin variant must not run privileged"
+        );
+        assert_eq!(
+            sec.allow_privilege_escalation,
+            Some(false),
+            "device-plugin variant must keep allowPrivilegeEscalation=false"
+        );
+        let caps = sec.capabilities.as_ref().expect("capabilities must be set");
+        assert_eq!(
+            caps.add.as_deref(),
+            Some(&["NET_ADMIN".to_string()][..]),
+            "device-plugin variant must add only NET_ADMIN"
+        );
+        assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+        assert_eq!(
+            proxy
+                .resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .and_then(|l| l.get("squat.ai/tun"))
+                .map(|q| q.0.as_str()),
+            Some("1"),
+            "device-plugin variant must request one TUN device unit"
+        );
+        let sysctls = pod_spec_of(&sts)
+            .security_context
+            .as_ref()
+            .and_then(|s| s.sysctls.as_ref())
+            .expect("device-plugin variant must enable forwarding via pod sysctls");
+        let names: Vec<_> = sysctls.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"net.ipv4.ip_forward")
+                && names.contains(&"net.ipv6.conf.all.forwarding"),
+            "pod sysctls must enable IPv4 and IPv6 forwarding: {names:?}"
+        );
+        assert!(
+            pod_spec_of(&sts)
+                .volumes
+                .as_ref()
+                .is_none_or(|v| v.is_empty()),
+            "device-plugin variant must not mount hostPath volumes"
         );
     }
 }

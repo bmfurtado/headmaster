@@ -31,6 +31,16 @@ async fn ingress_creates_key_and_statefulset_and_registers() {
         name: "my-ingress".to_string(),
         ..Default::default()
     });
+    // The state secret below claims device_id 77; the node must exist in
+    // headscale, or rotate_stale_auth_key treats the registration as lost
+    // and wipes the proxy Secrets — device data included.
+    fake_server.state.lock().unwrap().nodes.push(Node {
+        id: 77,
+        name: "my-ingress".to_string(),
+        given_name: "my-ingress".to_string(),
+        ip_addresses: vec!["100.64.0.5".to_string()],
+        ..Default::default()
+    });
     let keys = Arc::clone(&fake_server.state);
     let connector = Arc::new(FakeConnector::new(fake_server).await);
 
@@ -947,6 +957,16 @@ async fn adding_access_to_existing_ingress_updates_node_tags() {
             name: "my-ingress".to_string(),
             ..Default::default()
         });
+    // The state secret below claims device_id 42; the node must exist in
+    // headscale, or rotate_stale_auth_key treats the registration as lost
+    // and wipes the proxy Secrets before set_tags ever runs.
+    fake_server.state.lock().unwrap().nodes.push(Node {
+        id: 42,
+        name: "my-ingress".to_string(),
+        given_name: "my-ingress".to_string(),
+        ip_addresses: vec!["100.64.0.5".to_string()],
+        ..Default::default()
+    });
     let state = Arc::clone(&fake_server.state);
     let connector = Arc::new(FakeConnector::new(fake_server).await);
 

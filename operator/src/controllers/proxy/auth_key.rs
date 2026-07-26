@@ -158,6 +158,9 @@ pub(crate) enum AuthKeyStatus {
 /// Both `user` and `managed_key_tags` may be set simultaneously. When
 /// `auto_tag` is `Some`, it is appended to the pre-auth key's `acl_tags` so
 /// the proxy registers with the operator-assigned tag required for access grants.
+/// `ephemeral` mints a key whose node headscale garbage-collects after it
+/// goes offline — the backstop for tun-mode proxies, whose node the operator
+/// also deletes explicitly on teardown.
 ///
 /// Creates the pre-auth key in headscale and immediately persists it to
 /// Kubernetes in a single function. If the Kubernetes save fails, the key is
@@ -175,6 +178,7 @@ pub(crate) async fn ensure_auth_key(
     auto_tag: Option<&str>,
     expiry_secs: u64,
     reusable: bool,
+    ephemeral: bool,
 ) -> Result<AuthKeyStatus, Error> {
     if existing_auth_key(ctx, ns, &names.config_secret_name)
         .await?
@@ -230,7 +234,7 @@ pub(crate) async fn ensure_auth_key(
         .create_pre_auth_key(CreatePreAuthKeyRequest {
             user: user_id,
             reusable,
-            ephemeral: false,
+            ephemeral,
             expiration: Some(Timestamp {
                 seconds: expiration_secs,
                 nanos: 0,
@@ -370,6 +374,7 @@ mod tests {
             None,
             600,
             false,
+            false,
         )
         .await;
 
@@ -403,6 +408,7 @@ mod tests {
             &["tag:server".to_string()],
             None,
             600,
+            false,
             false,
         )
         .await;
@@ -440,6 +446,7 @@ mod tests {
             &["tag:server".to_string()],
             None,
             600,
+            false,
             false,
         )
         .await;
@@ -498,6 +505,7 @@ mod tests {
             Some("tag:hm-default-test-ingress"),
             600,
             false,
+            false,
         )
         .await;
 
@@ -508,6 +516,43 @@ mod tests {
             keys[0].acl_tags,
             vec!["tag:server", "tag:hm-default-test-ingress"],
             "auto-tag must be appended after managed-key-tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_flag_reaches_headscale() {
+        let server = FakeHeadscaleServer::default();
+        let state = Arc::clone(&server.state);
+        let channel = spawn_fake_channel(server).await;
+        let mut headscale =
+            HeadscaleServiceClient::with_interceptor(channel, AuthInterceptor::bearer("test"));
+
+        let ctx = test_ctx(FaultService::client(get_404_patch_ok));
+        let child = ChildApplier::for_test(&ctx.client, "default", "test-proxy");
+        let names = ProxyNames::new("default", "test-ingress");
+
+        let result = ensure_auth_key(
+            &ctx,
+            "default",
+            &test_ingress().object_ref(&()),
+            &mut headscale,
+            &child,
+            &names,
+            None,
+            &["tag:server".to_string()],
+            None,
+            600,
+            false,
+            true,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), AuthKeyStatus::Ready);
+        let keys = state.lock().unwrap().pre_auth_keys.clone();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys[0].ephemeral,
+            "ephemeral=true must be forwarded to CreatePreAuthKey"
         );
     }
 
@@ -791,6 +836,7 @@ mod tests {
             &["tag:server".to_string()],
             None,
             600,
+            false,
             false,
         )
         .await;

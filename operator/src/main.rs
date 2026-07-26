@@ -50,6 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socat_image = std::env::var("SOCAT_IMAGE").expect("SOCAT_IMAGE env var must be set");
     let egress_dns_coredns_custom =
         std::env::var("EGRESS_DNS_COREDNS_CUSTOM").is_ok_and(|v| v == "true");
+    let tun_device = match std::env::var("TUN_DEVICE_ACCESS").as_deref() {
+        Ok("privileged") | Err(_) => operator::context::TunDeviceAccess::Privileged,
+        Ok("device-plugin") => operator::context::TunDeviceAccess::DevicePlugin {
+            resource: std::env::var("TUN_DEVICE_PLUGIN_RESOURCE")
+                .unwrap_or_else(|_| "squat.ai/tun".to_string()),
+        },
+        Ok(other) => {
+            return Err(format!(
+                "TUN_DEVICE_ACCESS={other:?}: expected \"privileged\" or \"device-plugin\""
+            )
+            .into());
+        }
+    };
     let operator_image =
         std::env::var("OPERATOR_IMAGE").expect("OPERATOR_IMAGE env var must be set");
 
@@ -101,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         headscale_image,
         proxy_image,
         socat_image,
+        tun_device,
         egress_dns_coredns_custom,
         operator_image,
         claim_default,
@@ -140,8 +154,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 headscale_instance_shutdown.cancelled_owned(),
             );
             // INGRESS_ENABLED gates both proxy controllers: they are two
-            // frontends (HTTP Ingresses, ExternalName Services) over the
-            // same proxy machinery, enabled and disabled as one unit.
+            // frontends (HTTP Ingresses; Services — egress and exposure)
+            // over the same proxy machinery, enabled and disabled as one
+            // unit.
             if ingress_enabled {
                 tokio::join!(
                     headscale_instance_fut,

@@ -112,6 +112,55 @@ pub(crate) async fn deregister_and_cleanup(
     Ok(())
 }
 
+/// Detects a parent whose `headscale-ref` now points at a different
+/// HeadscaleInstance than the one recorded in the proxy's state Secret. The
+/// node is deleted from the *old* instance and both proxy Secrets are reset,
+/// so the `ensure_auth_key` call that follows mints a fresh key against the
+/// new instance. Call before `rotate_stale_auth_key` on every reconcile of a
+/// Service-parented proxy.
+pub(crate) async fn reset_if_retargeted(
+    ctx: &Context,
+    op_ns: &str,
+    names: &ProxyNames,
+    new_headscale_ref: &str,
+) -> Result<(), Error> {
+    let secrets = Api::<Secret>::namespaced(ctx.client.clone(), op_ns);
+    let retarget = match secrets.get(&names.state_secret_name).await {
+        Ok(secret) => {
+            let old_ref = read_secret_string(&secret, "headscale_ref");
+            let old_node_id =
+                read_secret_string(&secret, "device_id").and_then(|s| s.parse::<u64>().ok());
+            old_ref
+                .filter(|r| r != new_headscale_ref)
+                .map(|r| (r, old_node_id))
+        }
+        Err(kube::Error::Api(ref e)) if e.code == 404 => None,
+        Err(e) => return Err(Error::Kube(e)),
+    };
+    let Some((old_headscale_ref, old_node_id)) = retarget else {
+        return Ok(());
+    };
+    if let Some(node_id) = old_node_id {
+        match headscale_connect(ctx, op_ns, &old_headscale_ref).await {
+            Ok(mut old_headscale) => {
+                match old_headscale
+                    .delete_node(DeleteNodeRequest { node_id })
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) if e.code() == Code::NotFound => {}
+                    Err(e) => return Err(Error::HeadscaleApi(e)),
+                }
+            }
+            Err(kube::Error::Api(ref ae)) if ae.code == 404 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    delete_ignoring_404(secrets.clone(), &names.config_secret_name).await?;
+    delete_ignoring_404(secrets, &names.state_secret_name).await?;
+    Ok(())
+}
+
 /// Explicitly deletes all proxy resources created in the operator namespace.
 ///
 /// Proxy resources are owned by their HeadscaleInstance (same namespace), so GC

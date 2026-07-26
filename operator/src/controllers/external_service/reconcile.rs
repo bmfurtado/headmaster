@@ -1,16 +1,16 @@
-//! Main reconcile loop for tailnet egress `Service` objects. For every
-//! ExternalName Service carrying the headmaster config annotation with a
-//! `tailnet-fqdn`, provisions an egress proxy — a pod that joins the tailnet
-//! as its own node and forwards each declared Service port to the tailnet
-//! destination — and points the Service's `externalName` at it, so in-cluster
-//! pods reach the tailnet host like any other Service.
+//! Main reconcile loop for annotated `Service` objects. Owns the shared
+//! adoption/release gates and the finalizer, then dispatches by shape:
+//! ExternalName Services get an egress proxy (this file) — a pod that joins
+//! the tailnet as its own node and forwards each declared Service port to
+//! the `tailnet-fqdn` destination, with `spec.externalName` pointed at it —
+//! and every other annotated Service is exposed onto the tailnet
+//! ([`super::expose`]).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use headscale_client::Code;
-use headscale_client::headscale::v1::{DeleteNodeRequest, SetTagsRequest};
+use headscale_client::headscale::v1::SetTagsRequest;
 use k8s_ext::{
     ContainerExt, EnvVarExt, PodSpecExt, PodTemplateSpecExt, ServiceExt, ServicePortExt,
     StatefulSetExt,
@@ -38,12 +38,14 @@ use crate::controllers::applier::{ChildApplier, delete_ignoring_404};
 use crate::controllers::proxy::{
     AuthKeyStatus, Error, ProxyNames, apply_proxy_rbac, cleanup_proxy_resources,
     deregister_and_cleanup, ensure_auth_key, ensure_state_secret, headscale_connect,
-    namespace_is_deleting, read_secret_json, read_secret_string, rotate_stale_auth_key,
+    namespace_is_deleting, read_secret_json, read_secret_string, reset_if_retargeted,
+    rotate_stale_auth_key,
 };
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
 use crate::types::{
-    ANNOTATION_CONFIG, EgressConsumer, HeadscaleInstance, IngressAnnotations, ResourceStatus,
+    ANNOTATION_CONFIG, EgressConsumer, HeadscaleInstance, IngressAnnotations, ProxyMode,
+    ResourceStatus,
 };
 
 const EXTERNAL_NAME_TYPE: &str = "ExternalName";
@@ -179,11 +181,18 @@ pub(super) fn is_egress_shape(svc: &Service) -> bool {
     is_external_name(svc) && svc.annotations().contains_key(ANNOTATION_CONFIG)
 }
 
+/// A non-ExternalName Service carrying our config annotation — a Service the
+/// user wants *exposed* onto the tailnet as its own node (the ingress
+/// direction), in tsnet or tun mode. See [`super::expose`].
+pub(super) fn is_expose_shape(svc: &Service) -> bool {
+    !is_external_name(svc) && svc.annotations().contains_key(ANNOTATION_CONFIG)
+}
+
 async fn reconcile(svc: Arc<Service>, ctx: Arc<Context>) -> Result<Action, Error> {
     let our_finalizer = crate::finalizer(&ctx.operator_namespace);
     let has_our_finalizer = svc.finalizers().iter().any(|f| f == &our_finalizer);
 
-    let is_ours_shape = is_egress_shape(&svc);
+    let is_ours_shape = is_egress_shape(&svc) || is_expose_shape(&svc);
     if !is_ours_shape && !has_our_finalizer {
         return Ok(Action::await_change());
     }
@@ -252,11 +261,11 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
     let op_ns = &ctx.operator_namespace;
     let names = ProxyNames::for_service(&svc_ns, &svc_name);
 
-    // Shape release: the annotation was removed, or the Service is no longer
-    // ExternalName. Deregister and relinquish. spec.externalName is left
-    // as-is; it may still point at the (now deleted) egress Service until the
-    // user updates it.
-    if !is_external_name(&svc) || !svc.annotations().contains_key(ANNOTATION_CONFIG) {
+    // Config release: the annotation was removed. Deregister and relinquish.
+    // spec.externalName is left as-is on a released egress Service; it may
+    // still point at the (now deleted) egress Service until the user updates
+    // it.
+    if !svc.annotations().contains_key(ANNOTATION_CONFIG) {
         if let Some(headscale_ref) = IngressAnnotations::headscale_ref(&*svc) {
             deregister_and_cleanup(ctx, op_ns, &names, &svc.object_ref(&()), &headscale_ref)
                 .await?;
@@ -284,6 +293,23 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         release_service(ctx, &svc_ns, &svc_name).await?;
         return Ok(Action::await_change());
     }
+
+    // Shape dispatch: ExternalName Services are tailnet egress; every other
+    // annotated Service is exposed onto the tailnet. A type flip lands in the
+    // other branch on the next reconcile and re-renders the same-named child
+    // resources in the new shape.
+    if is_external_name(&svc) {
+        apply_egress(svc, ctx).await
+    } else {
+        super::expose::apply_expose(svc, ctx).await
+    }
+}
+
+async fn apply_egress(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
+    let svc_ns = svc.namespace().unwrap_or_default();
+    let svc_name = svc.name_any();
+    let op_ns = &ctx.operator_namespace;
+    let names = ProxyNames::for_service(&svc_ns, &svc_name);
 
     let annotations = IngressAnnotations::parse(&*svc)?;
 
@@ -322,6 +348,17 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
                 &svc.object_ref(&()),
                 "IgnoredConfig",
                 "'host-network' does not apply to egress proxies; ignored",
+            )
+            .await;
+    }
+    if annotations.mode != ProxyMode::Tsnet {
+        let _ = ctx
+            .recorder()
+            .publish_warning(
+                &svc.object_ref(&()),
+                "IgnoredConfig",
+                "'mode' does not apply to egress proxies; it selects the \
+                 packet path for Ingress and exposed Service proxies",
             )
             .await;
     }
@@ -431,49 +468,7 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
     let mut headscale = headscale_connect(ctx, op_ns, &annotations.headscale_ref).await?;
 
     // If headscale_ref changed, deregister from old HI and reset secrets before ensure_auth_key.
-    let retarget = match Api::<Secret>::namespaced(ctx.client.clone(), op_ns)
-        .get(&names.state_secret_name)
-        .await
-    {
-        Ok(secret) => {
-            let old_ref = read_secret_string(&secret, "headscale_ref");
-            let old_node_id =
-                read_secret_string(&secret, "device_id").and_then(|s| s.parse::<u64>().ok());
-            old_ref
-                .filter(|r| r != &annotations.headscale_ref)
-                .map(|r| (r, old_node_id))
-        }
-        Err(kube::Error::Api(ref e)) if e.code == 404 => None,
-        Err(e) => return Err(Error::Kube(e)),
-    };
-    if let Some((old_headscale_ref, old_node_id)) = retarget {
-        if let Some(node_id) = old_node_id {
-            match headscale_connect(ctx, op_ns, &old_headscale_ref).await {
-                Ok(mut old_headscale) => {
-                    match old_headscale
-                        .delete_node(DeleteNodeRequest { node_id })
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) if e.code() == Code::NotFound => {}
-                        Err(e) => return Err(Error::HeadscaleApi(e)),
-                    }
-                }
-                Err(kube::Error::Api(ref ae)) if ae.code == 404 => {}
-                Err(e) => return Err(Error::Kube(e)),
-            }
-        }
-        delete_ignoring_404(
-            Api::<Secret>::namespaced(ctx.client.clone(), op_ns),
-            &names.config_secret_name,
-        )
-        .await?;
-        delete_ignoring_404(
-            Api::<Secret>::namespaced(ctx.client.clone(), op_ns),
-            &names.state_secret_name,
-        )
-        .await?;
-    }
+    reset_if_retargeted(ctx, op_ns, &names, &annotations.headscale_ref).await?;
 
     // A proxy that lost its headscale registration (or whose key expired
     // before it ever joined) is stuck on a dead key; clear the stale Secrets
@@ -500,6 +495,7 @@ async fn apply(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
         None,
         annotations.auth_key_expiry_secs,
         annotations.auth_key_reusable,
+        false,
     )
     .await?
     {
@@ -918,7 +914,11 @@ async fn cleanup(svc: Arc<Service>, ctx: &Context) -> Result<Action, Error> {
 /// Removes our finalizer from the Service and clears the `claimed-by`
 /// annotation. Same optimistic-lock dance as the Ingress controller's
 /// `release_ingress`.
-async fn release_service(ctx: &Context, svc_ns: &str, svc_name: &str) -> Result<(), Error> {
+pub(super) async fn release_service(
+    ctx: &Context,
+    svc_ns: &str,
+    svc_name: &str,
+) -> Result<(), Error> {
     let api = Api::<Service>::namespaced(ctx.client.clone(), svc_ns);
     let live = api.get(svc_name).await.map_err(Error::Kube)?;
     let our_finalizer = crate::finalizer(&ctx.operator_namespace);
@@ -1200,16 +1200,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_skips_non_external_name_service() {
+    async fn reconcile_adopts_annotated_cluster_ip_service_as_expose_shape() {
         let ctx = Arc::new(test_ctx(FaultService::client(all_500)));
-        let mut svc = egress_service(Some(
-            r#"{"headscale-ref":"main","user":"alice","tailnet-fqdn":"x.ts.example.com"}"#,
-        ));
+        let mut svc = egress_service(Some(r#"{"headscale-ref":"main","user":"alice"}"#));
         svc.spec.as_mut().unwrap().type_ = Some("ClusterIP".to_string());
         let result = reconcile(Arc::new(svc), ctx).await;
         assert!(
-            result.is_ok(),
-            "annotated non-ExternalName Service must be silently skipped"
+            result.is_err(),
+            "annotated ClusterIP Service must be processed as an exposed Service \
+             (K8s call expected)"
         );
     }
 

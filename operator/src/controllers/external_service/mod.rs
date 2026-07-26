@@ -1,15 +1,21 @@
-//! Tailnet egress controller — makes tailnet hosts reachable from in-cluster
-//! pods. For every `Service` of `type: ExternalName` carrying the headmaster
-//! config annotation with a `tailnet-fqdn`, provisions an egress proxy pod
-//! that joins the tailnet as its own node (userspace tailscaled with a
-//! loopback SOCKS5 listener) and socat-forwards each declared Service port to
-//! the tailnet destination; the Service's `externalName` is then pointed at
-//! the proxy, so pods dial the Service and land on the tailnet host.
+//! Service controller — Tailscale proxies for annotated `Service` objects,
+//! in both directions:
+//!
+//! - **Egress** (`type: ExternalName` + `tailnet-fqdn`): makes a tailnet host
+//!   reachable from in-cluster pods. The proxy joins the tailnet as its own
+//!   node (userspace tailscaled with a loopback SOCKS5 listener) and
+//!   socat-forwards each declared Service port to the tailnet destination;
+//!   the Service's `externalName` is then pointed at the proxy.
+//! - **Exposure** (any other annotated Service): puts the Service *on* the
+//!   tailnet as its own node — userspace TCP forwarding by default
+//!   (`mode: tsnet`) or kernel DNAT through a TUN device (`mode: tun`) for
+//!   high-bandwidth services. See [`expose`].
 //!
 //! Shares the proxy building blocks (names, auth keys, cleanup, headscale
 //! connection) with the Ingress controller via [`crate::controllers::proxy`].
 
 mod dns;
+mod expose;
 mod reconcile;
 
 pub use reconcile::stream;

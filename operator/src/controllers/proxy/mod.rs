@@ -20,10 +20,10 @@ pub(crate) use auth_key::{AuthKeyStatus, ensure_auth_key, rotate_stale_auth_key}
 pub(crate) use error::Error;
 pub(crate) use names::ProxyNames;
 pub(crate) use resources::{
-    apply_proxy_rbac, apply_proxy_statefulset, apply_serve_configmap, apply_wireguard_service,
-    ensure_state_secret,
+    ProxyNetworking, apply_proxy_rbac, apply_proxy_statefulset, apply_serve_configmap,
+    apply_tun_proxy_statefulset, apply_wireguard_service, ensure_state_secret,
 };
 pub(crate) use support::{
     cleanup_proxy_resources, deregister_and_cleanup, headscale_connect, namespace_is_deleting,
-    read_secret_json, read_secret_string,
+    read_secret_json, read_secret_string, reset_if_retargeted,
 };
