@@ -32,7 +32,7 @@ use crate::controllers::proxy::{
 };
 use crate::controllers::recorder::RecorderExt;
 use crate::labels;
-use crate::types::{HeadscaleInstance, IngressAnnotations, ResourceStatus};
+use crate::types::{HeadscaleInstance, IngressAnnotations, ProxyMode, ResourceStatus};
 
 // ── public entrypoints ────────────────────────────────────────────────────────
 
@@ -350,6 +350,20 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         return Ok(Action::await_change());
     }
 
+    // Ingress proxies always run the userspace serve path: `mode` selects
+    // the forwarding flavor of an exposed Service, nothing else.
+    if annotations.mode != ProxyMode::Tsnet {
+        let _ = ctx
+            .recorder()
+            .publish_warning(
+                &ingress.object_ref(&()),
+                "IgnoredConfig",
+                "'mode' does not apply to Ingresses; it selects how an exposed \
+                 (non-ExternalName) Service is forwarded",
+            )
+            .await;
+    }
+
     if namespace_is_deleting(&ctx.client, &ingress_ns).await? {
         tracing::info!(
             name = ingress_name,
@@ -586,6 +600,7 @@ async fn apply(ingress: Arc<Ingress>, ctx: &Context) -> Result<Action, Error> {
         auto_tag.as_deref(),
         annotations.auth_key_expiry_secs,
         annotations.auth_key_reusable,
+        false,
     )
     .await?
     {

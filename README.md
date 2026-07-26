@@ -266,6 +266,70 @@ Rules of the road:
   treated as cluster-unique; duplicates get a `DuplicateTailnetFqdn`
   warning event and the first Service in (namespace, name) order wins.
 
+### Exposing Services directly — and tun mode for high bandwidth
+
+An Ingress exposes an HTTP app; sometimes you want a whole `Service` on the
+tailnet at L4 — a database, a media server, anything that isn't HTTP. Annotate
+any non-ExternalName Service (ClusterIP, NodePort, LoadBalancer) with the
+config annotation and it gets its own proxy pod, tailnet node, MagicDNS name,
+and tags:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: jellyfin
+  annotations:
+    headmaster.potatonode.github.io/config: |
+      {
+        "headscale-ref": "main",
+        "managed-key-tags": ["tag:media"],
+        "mode": "tun"
+      }
+spec:
+  ports:
+    - port: 8096
+```
+
+The `mode` field selects how traffic is forwarded:
+
+- **`tsnet`** (default) — userspace tailscaled (netstack), same machinery as
+  Ingress proxies: one raw TCP forward per declared Service port, dialing the
+  Service's cluster DNS name. No privileges required. TCP only; throughput
+  tops out around what a userspace network stack can push.
+- **`tun`** — a real tailscaled with a TUN device (`TS_USERSPACE=false`).
+  All tailnet traffic addressed to the node is DNAT-forwarded in-kernel to
+  the Service's ClusterIP (`TS_DEST_IP`), UDP included. Built for
+  high-bandwidth services; with a direct (non-DERP) path it forwards at
+  near-wire speed instead of the ~100–150 Mbps a netstack proxy manages.
+  If the ClusterIP ever changes, the operator re-renders the pod and rolls
+  it. Headless Services can't be exposed in tun mode (nothing to DNAT to).
+
+tun-mode pods need `/dev/net/tun`, granted per the chart's `tunDevice`
+values:
+
+- `tunDevice.access: privileged` (default) — the proxy container runs
+  privileged with a hostPath mount of `/dev/net/tun`.
+- `tunDevice.access: device-plugin` — the container stays unprivileged: it
+  requests one unit of `tunDevice.devicePluginResource` (default
+  `squat.ai/tun`, as advertised by
+  [generic-device-plugin](https://github.com/squat/generic-device-plugin))
+  and adds only `CAP_NET_ADMIN`. IP forwarding is enabled via pod
+  `securityContext.sysctls`, so the kubelet must allow the
+  `net.ipv4.ip_forward` and `net.ipv6.conf.all.forwarding` sysctls (k3s:
+  `--kubelet-arg=allowed-unsafe-sysctls=net.ipv4.ip_forward,net.ipv6.conf.all.forwarding`).
+
+Notes:
+
+- tun-mode nodes register with an **ephemeral** pre-auth key: the operator
+  deletes the headscale node on Service deletion anyway, and ephemeral
+  expiry is the backstop if that delete is ever missed.
+- `host-network` applies to tsnet mode only (it behaves exactly like on an
+  Ingress); in tun mode it is ignored with a warning — the TUN device must
+  stay inside the pod's network namespace.
+- `access` grants are not supported on exposed Services yet; grant access to
+  the proxy's tag in the tailnet ACL instead.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development environment setup and

@@ -9,4 +9,5 @@ pub use headscale_instance::{
 };
 pub use ingress_annotations::{
     ANNOTATION_CONFIG, AnnotationError, EgressConsumer, IngressAccessGrant, IngressAnnotations,
+    ProxyMode,
 };

@@ -22,6 +22,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Context {
         headscale_image: "test".to_string(),
         proxy_image: "test".to_string(),
         socat_image: "test".to_string(),
+        tun_device: crate::context::TunDeviceAccess::Privileged,
         egress_dns_coredns_custom: false,
         operator_image: "test".to_string(),
         claim_default: true,

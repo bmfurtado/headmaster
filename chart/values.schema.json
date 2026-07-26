@@ -215,6 +215,26 @@
       },
       "type": "object"
     },
+    "tunDevice": {
+      "additionalProperties": false,
+      "description": "How tun-mode proxy pods (Services exposed with \"mode\": \"tun\") get access to /dev/net/tun.",
+      "properties": {
+        "access": {
+          "description": "privileged: privileged container + hostPath /dev/net/tun. device-plugin: request one devicePluginResource unit and add only CAP_NET_ADMIN; needs a device plugin advertising the resource and the kubelet to allow the net.ipv4.ip_forward and net.ipv6.conf.all.forwarding sysctls.",
+          "enum": [
+            "privileged",
+            "device-plugin"
+          ],
+          "type": "string"
+        },
+        "devicePluginResource": {
+          "description": "Extended-resource name requested in device-plugin mode (e.g. squat.ai/tun from squat/generic-device-plugin).",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "egressDns": {
       "additionalProperties": false,
       "description": "In-cluster DNS for tailnet egress Services.",

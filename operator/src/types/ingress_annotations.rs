@@ -43,6 +43,21 @@ pub struct IngressAccessGrant {
     pub capabilities: Option<BTreeMap<String, Vec<serde_json::Value>>>,
 }
 
+/// How an exposed Service's proxy forwards traffic onto the tailnet node.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyMode {
+    /// Userspace tailscaled (netstack): traffic is forwarded via the proxy's
+    /// serve config. No special privileges, works everywhere. The default.
+    #[default]
+    Tsnet,
+    /// Kernel forwarding: real tailscaled with a TUN device, DNAT-ing tailnet
+    /// traffic to the Service's ClusterIP. Much higher throughput; the proxy
+    /// pod needs access to /dev/net/tun (see the operator's tunDevice config).
+    /// Only meaningful on exposed ClusterIP Services.
+    Tun,
+}
+
 /// One entry in the `consumers` list of an egress Service annotation: pods
 /// allowed to reach the egress proxy. Enforced as an operator-generated
 /// NetworkPolicy on the proxy pods.
@@ -97,6 +112,12 @@ pub struct IngressAnnotations {
     pub consumers: Vec<EgressConsumer>,
     #[serde(default)]
     pub access: Vec<IngressAccessGrant>,
+    /// Exposed ClusterIP Services only: how the proxy forwards traffic.
+    /// `tsnet` (default) runs a userspace proxy; `tun` runs a kernel-mode
+    /// tailscaled with a TUN device for high-bandwidth workloads. Ignored on
+    /// Ingresses and egress (ExternalName) Services.
+    #[serde(default)]
+    pub mode: ProxyMode,
 }
 
 impl IngressAnnotations {
@@ -305,6 +326,36 @@ mod tests {
             IngressAnnotations::parse(&ingress),
             Err(AnnotationError::Invalid(_, _))
         ));
+    }
+
+    #[test]
+    fn annotation_parse_mode_defaults_to_tsnet_when_absent() {
+        let ingress = ingress_with_config(serde_json::json!({}));
+        let parsed = IngressAnnotations::parse(&ingress).expect("must parse without mode");
+        assert_eq!(
+            parsed.mode,
+            ProxyMode::Tsnet,
+            "mode must default to tsnet when the field is omitted"
+        );
+    }
+
+    #[test]
+    fn annotation_parse_mode_tun_is_respected() {
+        let ingress = ingress_with_config(serde_json::json!({"mode": "tun"}));
+        let parsed = IngressAnnotations::parse(&ingress).expect("must parse with mode tun");
+        assert_eq!(parsed.mode, ProxyMode::Tun);
+    }
+
+    #[test]
+    fn annotation_parse_mode_unknown_value_rejected() {
+        let ingress = ingress_with_config(serde_json::json!({"mode": "wireguard"}));
+        assert!(
+            matches!(
+                IngressAnnotations::parse(&ingress),
+                Err(AnnotationError::Invalid(_, _))
+            ),
+            "unknown mode value must be rejected"
+        );
     }
 
     #[test]

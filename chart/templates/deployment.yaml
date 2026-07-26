@@ -65,6 +65,10 @@ spec:
               value: "{{ .Values.proxyImage.repository }}:{{ .Values.proxyImage.tag }}"
             - name: SOCAT_IMAGE
               value: "{{ .Values.socatImage.repository }}:{{ .Values.socatImage.tag }}"
+            - name: TUN_DEVICE_ACCESS
+              value: {{ .Values.tunDevice.access | quote }}
+            - name: TUN_DEVICE_PLUGIN_RESOURCE
+              value: {{ .Values.tunDevice.devicePluginResource | quote }}
             - name: EGRESS_DNS_COREDNS_CUSTOM
               value: {{ .Values.egressDns.corednsCustom | quote }}
             - name: RUST_LOG
