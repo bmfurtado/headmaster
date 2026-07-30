@@ -4,13 +4,14 @@
 //! joins the tailnet for the first time).
 //!
 //! The key's job is over once the proxy has joined — but "joined" is not a
-//! permanent state: the headscale node can be deleted or expire server-side,
-//! and then the proxy needs a *working* key again to get back on the tailnet.
-//! `rotate_stale_auth_key` detects both dead-end states (registration lost,
-//! key expired before first join) and clears the stale Secret so
-//! `ensure_auth_key` mints a fresh key on the same reconcile. Without it a
-//! proxy that loses its registration crash-loops on the dead key forever
-//! while the operator, seeing a Secret present, believes all is well.
+//! permanent state: the headscale node can be deleted, expire server-side, or
+//! simply stop being accepted, and then the proxy needs a *working* key again
+//! to get back on the tailnet. `rotate_stale_auth_key` detects all three
+//! dead-end states (registration lost, registration refused, key expired
+//! before first join) and clears the stale Secret so `ensure_auth_key` mints a
+//! fresh key on the same reconcile. Without it a proxy that loses its
+//! registration crash-loops on the dead key forever while the operator, seeing
+//! a Secret present, believes all is well.
 
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use headscale_client::{AuthenticatedClient, Code, Status};
 use k8s_ext::{SecretExt, SecretGetExt};
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::ObjectReference;
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::Api;
 use prost_types::Timestamp;
@@ -34,7 +36,7 @@ use crate::controllers::recorder::RecorderExt;
 
 /// Detects a proxy whose auth key can never work again and deletes the stale
 /// Secrets so the `ensure_auth_key` call that follows mints a fresh key.
-/// Call before `ensure_auth_key` on every reconcile. Two dead-end states:
+/// Call before `ensure_auth_key` on every reconcile. Three dead-end states:
 ///
 /// - **Registration lost** — the state Secret records a `device_id`, but
 ///   headscale no longer has that node (deleted out-of-band) or the node's
@@ -43,6 +45,12 @@ use crate::controllers::recorder::RecorderExt;
 ///   config and state Secrets are deleted: the fresh key lets the proxy
 ///   re-register, and dropping the state makes that a clean first boot
 ///   instead of a fight over a dead node identity.
+/// - **Registration refused** — the node row is present and unexpired, yet
+///   headscale answers `RegisterReq` with `machineAuthorized=false` and the
+///   proxy dies on `authkey expired`. Asking headscale about the node cannot
+///   see this, because by that measure nothing is wrong; the proxy pod
+///   crash-looping is the only honest signal. Rotated like a lost
+///   registration.
 /// - **Never joined, key expired** — no `device_id` yet and the config
 ///   Secret has outlived the key's expiry window, so the key inside cannot
 ///   register anyone. Only the config Secret is deleted.
@@ -71,17 +79,43 @@ pub(crate) async fn rotate_stale_auth_key(
 
     if let Some(node_id) = device_id {
         let now = now_epoch_secs();
-        let lost = match headscale.get_node(GetNodeRequest { node_id }).await {
-            // expiry unset or zero means "never expires" in headscale.
-            Ok(resp) => resp
-                .into_inner()
-                .node
-                .and_then(|n| n.expiry)
-                .is_some_and(|t| t.seconds > 0 && t.seconds < now),
-            Err(e) if e.code() == Code::NotFound => true,
+        let (lost, online) = match headscale.get_node(GetNodeRequest { node_id }).await {
+            Ok(resp) => match resp.into_inner().node {
+                // expiry unset or zero means "never expires" in headscale.
+                Some(node) => (
+                    node.expiry
+                        .is_some_and(|t| t.seconds > 0 && t.seconds < now),
+                    node.online,
+                ),
+                None => (false, false),
+            },
+            Err(e) if e.code() == Code::NotFound => (true, false),
             Err(e) => return Err(e.into()),
         };
         if !lost {
+            // `online` is the cheap exit: a proxy holding a map connection is
+            // registered by definition, and this is the path every healthy
+            // proxy takes on every reconcile, so it must not cost an API call.
+            // Only once headscale says the node is not connected is it worth
+            // asking whether the pod is stuck.
+            if online || !registration_refused(ctx, ns, &secrets, names, expiry_secs).await? {
+                return Ok(());
+            }
+            let recorder = ctx.recorder();
+            let _ = recorder
+                .publish_warning(
+                    parent_ref,
+                    "ProxyAuthKeyRejected",
+                    &format!(
+                        "node {node_id} is present and unexpired but the proxy \
+                         is crash-looping and offline, so headscale is refusing \
+                         its registration; rotating the auth key and resetting \
+                         proxy state so it can re-register"
+                    ),
+                )
+                .await;
+            delete_ignoring_404(secrets.clone(), &names.config_secret_name).await?;
+            delete_ignoring_404(secrets, &names.state_secret_name).await?;
             return Ok(());
         }
         let recorder = ctx.recorder();
@@ -109,15 +143,7 @@ pub(crate) async fn rotate_stale_auth_key(
         Err(kube::Error::Api(ref e)) if e.code == 404 => return Ok(()),
         Err(e) => return Err(Error::Kube(e)),
     };
-    let minted_at = config_secret
-        .metadata
-        .creation_timestamp
-        .as_ref()
-        .map(|t| t.0.as_second());
-    let expired = minted_at.is_some_and(|created| {
-        created.saturating_add(i64::try_from(expiry_secs).unwrap_or(i64::MAX)) < now_epoch_secs()
-    });
-    if !expired {
+    if !key_window_elapsed(&config_secret, expiry_secs) {
         return Ok(());
     }
     let recorder = ctx.recorder();
@@ -141,6 +167,84 @@ fn now_epoch_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or_default()
+}
+
+/// True once the config Secret has outlived the window its key was minted
+/// with, i.e. the key inside can no longer register anyone. A Secret with no
+/// creation timestamp is treated as fresh: without a clock to judge it by,
+/// deleting a key that might still work is the worse guess.
+fn key_window_elapsed(config_secret: &Secret, expiry_secs: u64) -> bool {
+    config_secret
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| t.0.as_second())
+        .is_some_and(|created| {
+            created.saturating_add(i64::try_from(expiry_secs).unwrap_or(i64::MAX))
+                < now_epoch_secs()
+        })
+}
+
+/// Decides the "registration refused" dead end: headscale keeps the node row
+/// but will not let this proxy back on, so the proxy dies on a spent key with
+/// no way to ask for a new one.
+///
+/// Two conditions have to hold together, and neither is sufficient alone. The
+/// key must be past its window — a healthy proxy's key is equally spent, so
+/// this cannot be the only test — and the proxy must actually be crash-looping,
+/// which is what distinguishes "cannot register" from "registered long ago and
+/// fine ever since". Requiring the elapsed window also supplies the hysteresis:
+/// a key minted moments ago has not had its chance yet, so at most one rotation
+/// happens per expiry window no matter how fast reconciles arrive.
+async fn registration_refused(
+    ctx: &Context,
+    ns: &str,
+    secrets: &Api<Secret>,
+    names: &ProxyNames,
+    expiry_secs: u64,
+) -> Result<bool, Error> {
+    let config_secret = match secrets.get(&names.config_secret_name).await {
+        Ok(secret) => secret,
+        // No key to rotate; ensure_auth_key will mint one.
+        Err(kube::Error::Api(ref e)) if e.code == 404 => return Ok(false),
+        Err(e) => return Err(Error::Kube(e)),
+    };
+    if !key_window_elapsed(&config_secret, expiry_secs) {
+        return Ok(false);
+    }
+    proxy_crash_looping(ctx, ns, names).await
+}
+
+/// True when the proxy pod has a container stuck in `CrashLoopBackOff`.
+///
+/// The pod is always `<proxy>-0`: proxy StatefulSets are single-replica.
+/// Container names differ by flavor — the serve and tun proxies build one
+/// named `proxy`, an egress proxy builds `tailscale` alongside `forwarder` —
+/// so this matches any container rather than hardcoding a name. Only the
+/// tailscaled container can fail this way, and a proxy whose *other* container
+/// is wedged is not healthy either.
+///
+/// A missing pod is not crash-looping: the StatefulSet may not have been
+/// created yet, and a proxy that never started has no key problem to diagnose.
+async fn proxy_crash_looping(ctx: &Context, ns: &str, names: &ProxyNames) -> Result<bool, Error> {
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
+    let pod = match pods.get(&format!("{}-0", names.proxy_name)).await {
+        Ok(pod) => pod,
+        Err(kube::Error::Api(ref e)) if e.code == 404 => return Ok(false),
+        Err(e) => return Err(Error::Kube(e)),
+    };
+    Ok(pod
+        .status
+        .and_then(|status| status.container_statuses)
+        .is_some_and(|statuses| {
+            statuses.iter().any(|c| {
+                c.state
+                    .as_ref()
+                    .and_then(|state| state.waiting.as_ref())
+                    .and_then(|waiting| waiting.reason.as_deref())
+                    == Some("CrashLoopBackOff")
+            })
+        }))
 }
 
 /// Outcome of `ensure_auth_key`: either the key is available and provisioning
@@ -584,6 +688,50 @@ mod tests {
         (201, br#"{}"#.to_vec())
     }
 
+    /// The proxy pod with its tailscale container wedged in CrashLoopBackOff —
+    /// what a proxy dying on `authkey expired` actually looks like.
+    const POD_CRASHLOOPING: &[u8] = br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"proxy-default-test-ingress-0","namespace":"default"},"status":{"containerStatuses":[{"name":"tailscale","ready":false,"restartCount":228,"image":"tailscale/tailscale:v1.98.8","imageID":"","state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}"#;
+
+    /// The same pod, running normally.
+    const POD_RUNNING: &[u8] = br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"proxy-default-test-ingress-0","namespace":"default"},"status":{"containerStatuses":[{"name":"tailscale","ready":true,"restartCount":0,"image":"tailscale/tailscale:v1.98.8","imageID":"","state":{"running":{"startedAt":"2026-01-01T00:00:00Z"}}}]}}"#;
+
+    /// Config Secret whose creationTimestamp is far enough in the future that
+    /// the expiry window cannot have elapsed.
+    const FRESH_AUTHKEY: &[u8] = br#"{"apiVersion":"v1","kind":"Secret","metadata":{"name":"k","namespace":"default","resourceVersion":"1","creationTimestamp":"2100-01-01T00:00:00Z"},"data":{"key":"a2V5"}}"#;
+
+    /// Registered proxy, key long past its window, pod crash-looping: the
+    /// "registration refused" shape, where the node row looks healthy and only
+    /// the pod betrays that headscale is turning the proxy away.
+    fn refused_proxy(m: &http::Method, p: &str) -> (u16, Vec<u8>) {
+        if *m != http::Method::DELETE && p.contains("/pods/") {
+            return (200, POD_CRASHLOOPING.to_vec());
+        }
+        registered_proxy(m, p)
+    }
+
+    /// Registered proxy whose key is equally stale but whose pod is healthy.
+    /// Every long-lived proxy looks like this, so it must never be rotated.
+    fn settled_proxy(m: &http::Method, p: &str) -> (u16, Vec<u8>) {
+        if *m != http::Method::DELETE && p.contains("/pods/") {
+            return (200, POD_RUNNING.to_vec());
+        }
+        registered_proxy(m, p)
+    }
+
+    /// Registered proxy, pod crash-looping, but the key was minted moments ago
+    /// and has not had its chance yet.
+    fn refused_proxy_fresh_key(m: &http::Method, p: &str) -> (u16, Vec<u8>) {
+        if *m != http::Method::DELETE {
+            if p.contains("/pods/") {
+                return (200, POD_CRASHLOOPING.to_vec());
+            }
+            if p.contains("proxy-authkey") {
+                return (200, FRESH_AUTHKEY.to_vec());
+            }
+        }
+        registered_proxy(m, p)
+    }
+
     /// No state Secret; config Secret minted in 2020 (long past any expiry).
     fn unregistered_stale_key(m: &http::Method, p: &str) -> (u16, Vec<u8>) {
         if *m == http::Method::DELETE {
@@ -625,6 +773,14 @@ mod tests {
         (201, br#"{}"#.to_vec())
     }
 
+    fn touched_pods(calls: &crate::test_support::Calls) -> bool {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, p)| p.contains("/pods/"))
+    }
+
     fn deletes_of(calls: &crate::test_support::Calls) -> Vec<String> {
         calls
             .lock()
@@ -660,6 +816,7 @@ mod tests {
                 id: 1,
                 user: Some(User::default()),
                 expiry: None,
+                online: true,
                 ..Default::default()
             });
 
@@ -681,6 +838,133 @@ mod tests {
         assert!(
             deletes_of(&calls).is_empty(),
             "healthy registration must not delete anything"
+        );
+        assert!(
+            !touched_pods(&calls),
+            "a node holding a map connection is registered by definition; the \
+             hot path must not spend an API call reading its pod"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_resets_both_secrets_when_headscale_refuses_a_healthy_looking_node() {
+        use headscale_client::headscale::v1::User;
+
+        let (state, mut headscale) = fake_headscale_with_state().await;
+        state
+            .lock()
+            .unwrap()
+            .nodes
+            .push(headscale_client::headscale::v1::Node {
+                id: 1,
+                user: Some(User::default()),
+                // Present and unexpired: by every measure headscale exposes,
+                // this node is fine. It is still refusing the registration.
+                expiry: None,
+                online: false,
+                ..Default::default()
+            });
+
+        let (client, calls) = FaultService::tracked(refused_proxy);
+        let ctx = test_ctx(client);
+        let names = ProxyNames::new("default", "test-ingress");
+
+        rotate_stale_auth_key(
+            &ctx,
+            "default",
+            &test_ingress().object_ref(&()),
+            &mut headscale,
+            &names,
+            600,
+        )
+        .await
+        .unwrap();
+
+        let deletes = deletes_of(&calls);
+        assert!(
+            deletes.iter().any(|p| p.contains("proxy-authkey"))
+                && deletes.iter().any(|p| p.contains("proxy-state")),
+            "a crash-looping proxy whose node looks healthy must still be \
+             rotated, or it loops on the spent key forever: {deletes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_keeps_secrets_when_an_offline_node_has_a_running_pod() {
+        use headscale_client::headscale::v1::User;
+
+        let (state, mut headscale) = fake_headscale_with_state().await;
+        state
+            .lock()
+            .unwrap()
+            .nodes
+            .push(headscale_client::headscale::v1::Node {
+                id: 1,
+                user: Some(User::default()),
+                expiry: None,
+                online: false,
+                ..Default::default()
+            });
+
+        let (client, calls) = FaultService::tracked(settled_proxy);
+        let ctx = test_ctx(client);
+        let names = ProxyNames::new("default", "test-ingress");
+
+        rotate_stale_auth_key(
+            &ctx,
+            "default",
+            &test_ingress().object_ref(&()),
+            &mut headscale,
+            &names,
+            600,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            deletes_of(&calls).is_empty(),
+            "a briefly disconnected node whose pod is running is not a dead \
+             end; every long-lived proxy has an equally spent key"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_leaves_a_just_minted_key_alone_while_the_proxy_retries() {
+        use headscale_client::headscale::v1::User;
+
+        let (state, mut headscale) = fake_headscale_with_state().await;
+        state
+            .lock()
+            .unwrap()
+            .nodes
+            .push(headscale_client::headscale::v1::Node {
+                id: 1,
+                user: Some(User::default()),
+                expiry: None,
+                online: false,
+                ..Default::default()
+            });
+
+        let (client, calls) = FaultService::tracked(refused_proxy_fresh_key);
+        let ctx = test_ctx(client);
+        let names = ProxyNames::new("default", "test-ingress");
+
+        rotate_stale_auth_key(
+            &ctx,
+            "default",
+            &test_ingress().object_ref(&()),
+            &mut headscale,
+            &names,
+            600,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            deletes_of(&calls).is_empty(),
+            "the proxy only picks a new key up on its next backoff restart, so \
+             rotating again before the window elapses burns keys and resets \
+             state on every reconcile"
         );
     }
 
