@@ -10,7 +10,15 @@ use serde::Deserialize;
 
 pub const ANNOTATION_CONFIG: &str = "headmaster.potatonode.github.io/config";
 
-const DEFAULT_AUTH_KEY_EXPIRY_SECS: u64 = 600;
+/// Must stay comfortably above the kubelet's CrashLoopBackOff ceiling of five
+/// minutes. A proxy that needs a fresh key is by definition crash-looping, and
+/// it can only pick the key up on a restart — `TS_AUTHKEY` is a `secretKeyRef`,
+/// resolved when the container is created. At 600s a rotated key got one or two
+/// restarts before expiring again, which is close enough to the ceiling that a
+/// single slow attempt puts the proxy into a rotate/expire ping-pong it never
+/// escapes. The key is still single-use and non-reusable; the wider window only
+/// means a spent credential sits in a Secret somewhat longer.
+const DEFAULT_AUTH_KEY_EXPIRY_SECS: u64 = 1800;
 
 fn default_auth_key_expiry_secs() -> u64 {
     DEFAULT_AUTH_KEY_EXPIRY_SECS
