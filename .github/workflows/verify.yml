@@ -167,8 +167,8 @@ jobs:
       - run: task test-e2e
         env:
           CACHE_ARGS: >-
-            --cache-from type=registry,ref=ghcr.io/potatonode/headmaster:buildcache-${{ matrix.arch }}
-            --cache-to type=registry,ref=ghcr.io/potatonode/headmaster:buildcache-${{ matrix.arch }},mode=max
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }}
+            --cache-to type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }},mode=max
 
   test-e2e-ok:
     name: E2E tests
