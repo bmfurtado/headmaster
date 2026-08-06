@@ -1,6 +1,6 @@
 [package]
 name = "headmaster"
-version = "0.2.0-next"
+version = "0.3.0"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/potatonode/headmaster"

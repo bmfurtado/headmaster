@@ -2,7 +2,7 @@ apiVersion: v2
 name: headmaster
 description: Kubernetes operator for the headscale control plane
 type: application
-version: 0.2.0-next
-appVersion: "0.2.0-next"
+version: 0.3.0
+appVersion: 0.3.0
 icon: >-
   https://raw.githubusercontent.com/juanfont/headscale/main/docs/logo/headscale3.svg
