@@ -1269,11 +1269,11 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "headmaster"
-version = "0.2.0-next"
+version = "0.3.0"
 
 [[package]]
 name = "headscale-client"
-version = "0.2.0-next"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "hyper-util",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "integration-tests"
-version = "0.2.0-next"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "dtor",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "k8s-ext"
-version = "0.2.0-next"
+version = "0.3.0"
 dependencies = [
  "k8s-openapi",
 ]
@@ -2226,7 +2226,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "operator"
-version = "0.2.0-next"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2978,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "scim"
-version = "0.2.0-next"
+version = "0.3.0"
 dependencies = [
  "axum",
  "futures",
