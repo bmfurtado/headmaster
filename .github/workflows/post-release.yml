@@ -13,9 +13,14 @@ name: post-release
 # the global GitHub Actions app) means the bypass is scoped to workflows that
 # explicitly hold the app credentials — nothing else can bypass.
 #
-# Two repo secrets are required:
+# Two repo secrets enable the app path:
 #   BUMP_APP_ID          — the App ID or Client ID shown on the app's settings page
 #   BUMP_APP_PRIVATE_KEY — a private key generated on the app's settings page
+#
+# On forks where those secrets are absent, the job falls back to the default
+# GITHUB_TOKEN. That only works while the fork's main branch is unprotected
+# (i.e. rulesets/main.json was never applied there), and pushes made with
+# GITHUB_TOKEN do not trigger other workflows on the bump commit.
 
 on:
   push:
@@ -28,9 +33,14 @@ jobs:
   bump-next:
     name: Bump to next suffix version
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      BUMP_APP_ID: ${{ secrets.BUMP_APP_ID }}
     steps:
       - uses: actions/create-github-app-token@v3
         id: app-token
+        if: ${{ env.BUMP_APP_ID != '' }}
         with:
           client-id: ${{ secrets.BUMP_APP_ID }}
           private-key: ${{ secrets.BUMP_APP_PRIVATE_KEY }}
@@ -38,7 +48,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: main
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
 
